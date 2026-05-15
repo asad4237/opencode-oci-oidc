@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Plugin list
+  "plugin": ["/home/ubuntu/plt-p-llm-proxy/oci-opencode-auth/dist/index.js"],
+
+  // Provider configuration for OpenAI-compatible endpoint
+  "provider": {
+    "oci-oidc": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OCI OIDC Auth",
+      "models": {
+        "llama-3-1-70b": {
+          "id": "meta-llama/Llama-3.1-70B-Instruct",
+          "name": "Llama 3.1 70B (OCI GPU)",
+          "limit": { "context": 131072, "output": 8192 }
+        }
+      }
+    }
+  },
+  // Set default model
+  "model": "oci-oidc/llama-3-1-70b"
+}

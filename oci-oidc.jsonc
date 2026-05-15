@@ -1,0 +1,12 @@
+{
+  "domain_url": "https://idcs-1ec9c20a08244e0c93f84260c12594f6.identity.oraclecloud.com",
+  "client_id": "461d5b388138452da80777c9e51eca6e",
+  "client_secret": "idcscs-0537b4f6-3314-4213-ace2-b84c83cb6816",
+  "redirect_uri": "http://localhost:8888/callback",
+  "scope": "openid",
+  "llm_base_url": "http://10.238.113.14/api",
+  "model_id": "meta-llama/Llama-3.1-70B-Instruct",
+  "model_display_name": "Llama 3.1 70B (OCI GPU)",
+  "context_tokens": 131072,
+  "max_tokens": 8192
+}
