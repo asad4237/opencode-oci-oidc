@@ -1,19 +1,20 @@
 /**
  * opencode-oci-oidc
  *
- * Authenticates with an OCI IAM Confidential Application via the OAuth 2.0
- * Client Credentials grant, then makes the resulting Bearer token available
- * to an OpenAI-compatible LLM endpoint running on OCI GPUs.
+ * OpenCode plugin that authenticates with OCI IAM and injects Bearer tokens
+ * into an OpenAI-compatible LLM endpoint.
  *
- * Config is read from opencode.json (no env vars required).
- * Secrets (client_secret) are read from a file via {file:} substitution,
- * keeping them out of source-controlled config.
+ * Two auth methods (configured via "auth_method" in oci-auth.config.jsonc):
  *
- * Real OpenCode plugin SDK hooks used:
- *   - shell.env          → inject OCI_BEARER_TOKEN into every shell/tool env
- *   - tool.execute.before → gate bash commands that would leak the secret
- *   - event              → refresh token on session.created
- *   - tool (custom)      → oci_oidc_refresh — lets the agent trigger a refresh
+ *   confidential_app — OAuth 2.0 Authorization Code flow + client_secret.
+ *                      Browser opens once; subsequent calls use the cached token.
+ *
+ *   mobile_app       — OAuth 2.0 Device Authorization Grant (RFC 8628).
+ *                      No secret, no browser. A short code is printed to the
+ *                      terminal; user approves it on the OCI Mobile Authenticator.
+ *
+ * Config file: oci-auth.config.jsonc  (next to this plugin)
+ * Logs:        ~/oci-oidc-debug.log   (default, configurable)
  */
 import type { Plugin } from "@opencode-ai/plugin";
 export declare const OciOidcPlugin: Plugin;

@@ -10,14 +10,14 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "OCI OIDC Auth",
       "models": {
-        "llama-3-1-70b": {
-          "id": "meta-llama/Llama-3.1-70B-Instruct",
-          "name": "Llama 3.1 70B (OCI GPU)",
-          "limit": { "context": 131072, "output": 8192 }
+        "tawn-gpt-oss-120b": {
+          "id": "tawn-gpt-oss-120b",
+          "name": "tawn-gpt-oss-120b"//,
+          //"limit": { "context": 131072, "output": 8192 }
         }
       }
     }
   },
   // Set default model
-  "model": "oci-oidc/llama-3-1-70b"
+  "model": "oci-oidc/tawn-gpt-oss-120b"
 }

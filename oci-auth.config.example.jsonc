@@ -1,0 +1,70 @@
+{
+  // ═══════════════════════════════════════════════════════════════════════
+  // opencode-oci-oidc — Auth Plugin Configuration Template
+  // ═══════════════════════════════════════════════════════════════════════
+  //
+  // USAGE
+  //   Copy this file to one of the following locations and fill in your values:
+  //
+  //   Option A  (per-project):  <your-project>/oci-auth.config.jsonc
+  //   Option B  (machine-wide): ~/.config/opencode/oci-auth.config.jsonc
+  //
+  //   The plugin searches Option A before Option B, so a project-level file
+  //   always wins.  Never place credentials in this file inside node_modules.
+  //
+  // SECRETS
+  //   You can provide client_secret as a plain string or as a file reference:
+  //     Plain text:    "client_secret": "idcscs-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  //     File ref:      "client_secret": "{file:~/.secrets/oci-client-secret}"
+  //   Use the file-reference form if you want to avoid storing the secret in
+  //   this file (e.g. when the config is inside a version-controlled project).
+  //   The plugin reads the value the same way either way.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // ── A: OCI IAM Credentials ─────────────────────────────────────────────
+  "domain_url":  "https://idcs-<your-idcs-id>.identity.oraclecloud.com",
+  "client_id":   "<your-client-id>",
+
+  // For confidential_app: provide client_secret as a plain string or file ref.
+  // For mobile_app:       omit client_secret entirely.
+  "client_secret": "<your-client-secret>",
+
+  // Internal redirect URI — where the local callback HTTP server listens.
+  "redirect_uri": "http://localhost:8888/callback",
+
+  // Public-facing redirect URI sent to OCI IAM.
+  // Only needed when running behind a proxy (e.g. VS Code port-forwarding).
+  // Remove this line entirely if you are NOT using a proxy.
+  // "browser_redirect_uri": "https://<proxy-host>/proxy/8888/callback",
+
+  "scope": "openid profile",
+
+  // Base URL of the OpenAI-compatible LLM endpoint (no trailing slash).
+  // The provider block, model IDs, and context sizes are managed in opencode.json.
+  "llm_base_url": "https://<your-oci-gpu-endpoint>/v1",
+
+  // ── B: Plugin Behaviour ────────────────────────────────────────────────
+
+  // "confidential_app" — browser-based OAuth 2.0 with client_secret
+  // "mobile_app"       — OCI Device Authorization Grant, no browser, no secret
+  "auth_method": "confidential_app",
+
+  // NONE | ERROR | WARN | INFO | DEBUG | VERBOSE
+  "log_level": "INFO",
+
+  // Log file path.  ~ is expanded.  null → platform default:
+  //   Linux/macOS:  ~/oci-oidc-debug.log
+  //   Windows:      %LOCALAPPDATA%\opencode-oci-oidc\plugin.log
+  "log_file": null,
+
+  "browser_timeout_seconds": 120,
+  "device_poll_interval_seconds": 5,
+  "device_timeout_seconds": 300,
+
+  // false (recommended) — browser/device flow triggers on your first message.
+  // true               — triggers immediately when opencode starts.
+  "auth_on_startup": false,
+
+  "max_retry_attempts": 3,
+  "retry_delay_ms": 1000
+}

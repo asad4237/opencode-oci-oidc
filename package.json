@@ -1,19 +1,20 @@
 {
   "name": "opencode-oci-oidc",
-  "version": "1.0.0",
-  "description": "OpenCode plugin: OCI OIDC Auth — authenticates with an OCI Confidential Application and injects Bearer tokens into an OpenAI-compatible LLM endpoint.",
+  "version": "1.1.0",
+  "description": "OpenCode plugin: OCI OIDC Auth — authenticates with OCI IAM (Confidential App or Mobile App / Device flow) and injects Bearer tokens into an OpenAI-compatible LLM endpoint.",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "type": "module",
   "exports": {
     ".": {
       "import": "./dist/index.js",
-      "require": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
   "files": [
     "dist",
+    "oci-auth.config.example.jsonc",
     "README.md"
   ],
   "scripts": {
@@ -30,9 +31,15 @@
     "oracle-cloud",
     "llm",
     "auth",
-    "oauth2"
+    "oauth2",
+    "device-flow",
+    "mobile-auth"
   ],
+  "author": "asad4237",
   "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   },
