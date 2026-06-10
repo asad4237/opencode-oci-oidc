@@ -4,10 +4,10 @@ An [OpenCode](https://opencode.ai) plugin that authenticates with **Oracle Cloud
 
 Two auth methods are supported:
 
-| Method | Description |
-|--------|-------------|
-| `confidential_app` | Browser-based OAuth 2.0 Authorization Code flow with a client secret |
-| `mobile_app` | OCI Device Authorization Grant (RFC 8628) — no browser, no secret; approve on the OCI Mobile Authenticator app |
+| Method | Status | Description |
+|--------|--------|-------------|
+| `confidential_app` | Tested | Browser-based OAuth 2.0 Authorization Code flow with a client secret |
+| `mobile_app` | Not tested | OCI Device Authorization Grant (RFC 8628) — no browser, no secret; approve on the OCI Mobile Authenticator app |
 
 Tokens are cached in memory and on disk and refreshed automatically using the refresh token when they expire. If the refresh token is also expired, the plugin prompts for re-authentication.
 
@@ -149,25 +149,62 @@ Same steps as above but:
 
 ## Logs
 
-Default log file: `~/oci-oidc-debug.log`
+The plugin writes a log file from the moment it loads — even before your config is read. This makes it the primary tool for diagnosing any issue.
 
-Change location and verbosity in `oci-auth.config.jsonc`:
+**Default log file location:**
+
+| Platform | Path |
+|----------|------|
+| Linux / macOS | `~/oci-oidc-debug.log` |
+| Windows | `%LOCALAPPDATA%\opencode-oci-oidc\plugin.log` |
+
+**To follow logs in real time:**
+```bash
+tail -f ~/oci-oidc-debug.log
+```
+
+**To enable detailed logging**, add these two lines to your `oci-auth.config.jsonc`:
 ```jsonc
 "log_level": "DEBUG",
-"log_file": "~/my-custom-path/oci-auth.log"
+"log_file": "~/oci-oidc-debug.log"
 ```
+
+On Windows, use forward slashes or double backslashes for the path — single backslashes are invalid in JSON and will prevent the config from loading:
+```jsonc
+"log_file": "C:/Users/you/oci-auth.log"      // recommended
+"log_file": "C:\\Users\\you\\oci-auth.log"   // also valid
+```
+
+Available log levels (most to least verbose): `VERBOSE` → `DEBUG` → `INFO` → `WARN` → `ERROR` → `NONE`
+
+> The log file is written to the **default path** even if your config fails to load. Check the default location first — the `[WARN]` entry will show exactly what went wrong and which paths were searched.
 
 ---
 
 ## Troubleshooting
 
+### `"undefined/chat/completions" cannot be parsed as a URL`
+
+The plugin could not find or read your `oci-auth.config.jsonc`. Steps to diagnose:
+
+1. Open `~/oci-oidc-debug.log` — look for a `[WARN]` entry listing the paths that were searched
+2. Make sure your config file is named exactly `oci-auth.config.jsonc` (not `.json`, not `oci-oidc.jsonc`)
+3. Place it in one of these locations:
+   - **Per-project:** same directory as `opencode.json` / `opencode.jsonc`
+   - **Machine-wide:** `~/.config/opencode/oci-auth.config.jsonc`
+4. Verify the file contains at least `domain_url`, `client_id`, and `llm_base_url` with real values (not `<placeholders>`)
+5. Validate the JSON is valid — JSONC comments (`// ...`) are supported but trailing commas are not
+
+### Other issues
+
 | Symptom | Fix |
 |---------|-----|
-| `No OCI auth config found` | Place `oci-auth.config.jsonc` next to `opencode.json` or in `~/.config/opencode/` |
-| Browser doesn't open | Check `redirect_uri` is registered in your OCI application |
-| Token rejected (401) after working | Run `oci_oidc_refresh` tool or `/connect` again |
-| Hanging after sending a message | Check `~/oci-oidc-debug.log` — look for network timeout errors |
-| No refresh token (`has_refresh_token: false` in logs) | Add `offline_access` to `scope` in the plugin config |
+| Browser doesn't open on `/connect` | Check `redirect_uri` matches what is registered in your OCI Confidential App |
+| Token rejected (401) after previously working | Run `oci_oidc_refresh` tool or `/connect` again |
+| Plugin keeps retrying auth silently | Check the log for `session.error` entries — likely a new/changed client secret |
+| Hanging after sending a message | Check log for `Network timeout` — indicates OCI IAM or the LLM endpoint is unreachable |
+| No refresh token (`has_refresh_token: false` in log) | Add `offline_access` to `scope` and ensure **Refresh Token** grant is enabled in the OCI app |
+| `mobile_app` flow not working | This flow has not been tested — only `confidential_app` is verified to work |
 
 ---
 

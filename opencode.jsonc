@@ -9,6 +9,9 @@
     "oci-oidc": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "OCI OIDC Auth",
+      "options": {
+        "baseURL": "https://10.238.113.14/api"
+      },
       "models": {
         "tawn-gpt-oss-120b": {
           "id": "tawn-gpt-oss-120b",

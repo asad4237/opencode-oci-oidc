@@ -69,7 +69,7 @@ const BEHAVIOUR_DEFAULTS: Pick<
   device_poll_interval_seconds: 5,
   device_timeout_seconds:       300,
   auth_on_startup:              false,
-  max_retry_attempts:           3,
+  max_retry_attempts:           1,
   retry_delay_ms:               1000,
 }
 
@@ -84,6 +84,10 @@ const REQUIRED_AUTH_FIELDS = ["domain_url", "client_id", "llm_base_url"] as cons
 process.on("unhandledRejection", (reason, promise) => {
   try {
     const msg = reason instanceof Error ? reason.message : String(reason)
+    // Intentional throws from our own hooks (e.g. chat.params blocking a request)
+    // propagate as unhandled rejections when OpenCode doesn't await them.
+    // These are expected — do not log them as bugs.
+    if (msg.includes("[oci-auth]")) return
     writeLog("ERROR", "[oci-auth] Unhandled promise rejection (bug — please report)", { reason: msg, promise: String(promise) })
   } catch { /* never crash inside the safety net */ }
 })
@@ -102,27 +106,48 @@ const LOG_RANK: Record<LogLevel, number> = {
   NONE: 0, ERROR: 1, WARN: 2, INFO: 3, DEBUG: 4, VERBOSE: 5,
 }
 
+// OpenCode client reference — set once the plugin initialises.
+// Stored as unknown to avoid fighting the SDK's internal generic types;
+// cast to any only at the log call site (fire-and-forget, errors suppressed).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _ocClient: any = null
+
 let _logLevel: LogLevel = "INFO"
-// Default until initLogger() is called. Uses CACHE_DIR so it is always writable.
-// On Linux/macOS this resolves to ~/.cache/opencode-oci-oidc/plugin.log;
-// on Windows to %LOCALAPPDATA%\opencode-oci-oidc\plugin.log.
-// The legacy ~/oci-oidc-debug.log path is preserved if the user explicitly
-// sets "log_file": "~/oci-oidc-debug.log" in their config.
-let _logFile: string = join(homedir(), "oci-oidc-debug.log")   // overridden in initLogger
+// Initialized after CACHE_DIR is resolved (see initLogFile() call below).
+let _logFile: string = ""
 
 function getDefaultLogFile(): string {
-  // Linux / macOS: ~/oci-oidc-debug.log  (matches what users already know)
-  // Windows:       %LOCALAPPDATA%\opencode-oci-oidc\plugin.log (home root is less accessible)
+  // Linux / macOS: ~/oci-oidc-debug.log
+  // Windows:       %LOCALAPPDATA%\opencode-oci-oidc\plugin.log  (always writable)
   return process.platform === "win32"
     ? join(CACHE_DIR, "plugin.log")
     : join(homedir(), "oci-oidc-debug.log")
 }
 
-function initLogger(cfg: OciAuthConfig): void {
+/** Call once at module load after CACHE_DIR is available. */
+function initLogFile(): void {
+  _logFile = getDefaultLogFile()
+  // Write the log path to stderr immediately so it appears in OpenCode's
+  // console output even before any config is found or any log entry is written.
+  process.stderr.write(`[oci-auth] Log file: ${_logFile}\n`)
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function initLogger(cfg: OciAuthConfig, client: any): void {
+  _ocClient = client
   _logLevel = cfg.log_level
-  _logFile  = cfg.log_file
-    ? cfg.log_file.replace(/^~/, homedir())
+  const resolved = cfg.log_file
+    ? cfg.log_file.replace(/^~/, homedir()).replace(/\//g, process.platform === "win32" ? "\\" : "/")
     : getDefaultLogFile()
+  if (resolved !== _logFile) {
+    _logFile = resolved
+    process.stderr.write(`[oci-auth] Log file (from config): ${_logFile}\n`)
+  }
+}
+
+// Map our log levels to OpenCode's expected level strings
+const OC_LEVEL: Record<LogLevel, string> = {
+  NONE: "info", ERROR: "error", WARN: "warn", INFO: "info", DEBUG: "debug", VERBOSE: "debug",
 }
 
 function writeLog(level: LogLevel, msg: string, data?: unknown): void {
@@ -130,10 +155,30 @@ function writeLog(level: LogLevel, msg: string, data?: unknown): void {
   const ts   = new Date().toISOString()
   const body = data !== undefined ? `${msg}: ${safeStr(data)}` : msg
   const line = `[${ts}] [${level}] [oci-auth] ${body}\n`
+
+  // 1. File log — surface write errors via stderr so the user knows the custom path failed
   try {
     mkdirSync(dirname(_logFile), { recursive: true })
     writeFileSync(_logFile, line, { flag: "a" })
-  } catch { /* never crash on log I/O */ }
+  } catch (fileErr) {
+    try {
+      process.stderr.write(`[oci-auth] WARNING: cannot write to log file "${_logFile}": ${String(fileErr)}\n`)
+      process.stderr.write(`[oci-auth] Falling back to stderr only. Check the path and permissions.\n`)
+    } catch { /* truly last resort */ }
+  }
+
+  // 2. stderr — always for ERROR/WARN, so they appear in the OpenCode console
+  //    even before the client is available or if client.app.log fails.
+  if (level === "ERROR" || level === "WARN") {
+    try { process.stderr.write(line) } catch { /* ignore */ }
+  }
+
+  // 3. OpenCode built-in logger — forwards to the OpenCode console for all levels.
+  //    Fire-and-forget; never await to avoid blocking the caller.
+  if (_ocClient) {
+    _ocClient.app.log({ body: { service: "oci-auth", level: OC_LEVEL[level], message: `[${level}] ${body}` } })
+      .catch(() => { /* ignore — never crash on log delivery */ })
+  }
 }
 
 const log = {
@@ -152,6 +197,13 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname  = dirname(__filename)
 const pluginRoot = join(__dirname, "..")
 
+// Read version from package.json at module load so it's always in sync with npm.
+let PLUGIN_VERSION = "unknown"
+try {
+  const pkg = JSON.parse(readFileSync(join(pluginRoot, "package.json"), "utf8")) as { version?: string }
+  PLUGIN_VERSION = pkg.version ?? "unknown"
+} catch { /* non-fatal */ }
+
 function loadConfig(projectPath: string): OciAuthConfig | null {
   // Search order: project dir first (most specific), then global user config,
   // then plugin root last (development-only fallback — not present in npm installs).
@@ -167,7 +219,25 @@ function loadConfig(projectPath: string): OciAuthConfig | null {
     // ── 2. Global user config ─────────────────────────────────────────────
     join(homedir(), ".config", "opencode", "oci-auth.config.json"),
     join(homedir(), ".config", "opencode", "oci-auth.config.jsonc"),
-    // ── 3. Legacy: separate auth-credentials files ────────────────────────
+    // ── 3. System-wide config (read-only, requires admin/root) ───────────
+    ...(process.platform === "darwin"
+      ? [
+          "/Library/Application Support/opencode/oci-auth.config.json",
+          "/Library/Application Support/opencode/oci-auth.config.jsonc",
+        ]
+      : process.platform === "win32"
+      ? [
+          ...(process.env.ProgramData
+            ? [
+                join(process.env.ProgramData, "opencode", "oci-auth.config.json"),
+                join(process.env.ProgramData, "opencode", "oci-auth.config.jsonc"),
+              ]
+            : []),
+        ]
+      : [
+          "/etc/opencode/oci-auth.config.json",
+          "/etc/opencode/oci-auth.config.jsonc",
+        ]),
     // ── 4. opencode.json with oci_oidc / provider key ─────────────────────
     join(projectPath, "opencode.json"),
     join(projectPath, "opencode.jsonc"),
@@ -178,11 +248,46 @@ function loadConfig(projectPath: string): OciAuthConfig | null {
     join(pluginRoot,  "oci-auth.config.jsonc")
   ]
 
+  const tried: string[] = []
+
   for (const p of candidates) {
-    writeLog("VERBOSE", "Checking config candidate", p)
+    tried.push(p)
+    writeLog("DEBUG", "Checking config candidate", p)
     try {
-      const raw    = readFileSync(p, "utf8")
-      const parsed = JSON.parse(stripJsonComments(raw)) as Record<string, unknown>
+      const raw = readFileSync(p, "utf8")
+      let parsed: Record<string, unknown>
+      const stripped = stripJsonComments(raw)
+      try {
+        parsed = JSON.parse(stripped) as Record<string, unknown>
+      } catch (parseErr) {
+        // Find the approximate line number from the error message position.
+        const posMatch = String(parseErr).match(/position\s+(\d+)|line\s+(\d+)/i)
+        let lineHint = ""
+        if (posMatch) {
+          const pos = parseInt(posMatch[1] ?? posMatch[2] ?? "0", 10)
+          const lines = stripped.split("\n")
+          let cur = 0
+          for (let i = 0; i < lines.length; i++) {
+            cur += lines[i].length + 1
+            if (cur >= pos) {
+              lineHint = `\n  Near line ${i + 1}: ${lines[i].trim()}`
+              break
+            }
+          }
+        }
+        writeLog("WARN",
+          `Config file found at "${p}" but failed to parse as JSON.\n` +
+          `  Error: ${String(parseErr)}${lineHint}\n` +
+          `  Common causes:\n` +
+          `    1. Windows path with single backslashes in "log_file" or other string values.\n` +
+          `       Use forward slashes:  "C:/Users/you/oci-auth.log"\n` +
+          `    2. Trailing comma after the last field (not valid in JSON).\n` +
+          `    3. Unmatched quote or brace.`
+        )
+        // Log the stripped content at DEBUG so the user can see what we tried to parse.
+        writeLog("DEBUG", `Stripped content of "${p}" that failed to parse`, stripped)
+        continue
+      }
 
       // Strategy 1: flat root-level config (merged format or legacy oci-oidc.jsonc)
       if (REQUIRED_AUTH_FIELDS.every(k => parsed[k])) {
@@ -207,11 +312,24 @@ function loadConfig(projectPath: string): OciAuthConfig | null {
         return { ...BEHAVIOUR_DEFAULTS, ...(provOpts as Partial<OciAuthConfig>) } as OciAuthConfig
       }
 
+      writeLog("DEBUG", "Config file found but missing required fields — skipping", {
+        path: p, required: REQUIRED_AUTH_FIELDS.join(", ")
+      })
     } catch (err) {
-      writeLog("VERBOSE", "Config candidate unreadable", { path: p, err: safeStr(err) })
+      writeLog("DEBUG", "Config candidate not found (file missing)", { path: p })
     }
   }
 
+  // Always log the full search path at ERROR so the user can diagnose placement issues
+  // without needing to change log_level (config isn't loaded yet at this point).
+  writeLog("ERROR",
+    "No valid OCI auth config found.\n" +
+    "  Expected file names: oci-auth.config.jsonc  OR  oci-auth.config.json\n" +
+    "  Searched paths (in priority order):\n" +
+    tried.map(p => `    - ${p}`).join("\n") + "\n" +
+    "  To fix: create oci-auth.config.jsonc in your project directory\n" +
+    "          or at ~/.config/opencode/oci-auth.config.jsonc for a machine-wide default."
+  )
   return null
 }
 
@@ -271,7 +389,14 @@ function getPlatformCacheDir(): string {
 const CACHE_DIR  = getPlatformCacheDir()
 const CACHE_PATH = join(CACHE_DIR, "token.json")
 
+// Initialise log file path now that CACHE_DIR is resolved.
+initLogFile()
+
 let _memCache: TokenCache | null = null
+
+// Auth-flow mutex: if a browser/device flow is already in progress, all
+// concurrent chat.params calls wait for it rather than opening more windows.
+let _authInProgress: Promise<string> | null = null
 
 // Timestamp (ms) of the most-recent session.created event.
 // Used to distinguish OpenCode's automatic startup probe requests (which fire
@@ -368,8 +493,16 @@ async function getToken(cfg: OciAuthConfig): Promise<string> {
   const refreshed = await tryRefreshToken(cfg)
   if (refreshed) return refreshed
 
-  log.info("No valid cached token and no refresh_token — triggering full auth flow", { method: cfg.auth_method })
-  return fetchFreshToken(cfg)
+  // Mutex: if a full auth flow (browser/device) is already running, wait for it
+  // instead of opening a second browser window / CMD window.
+  if (_authInProgress) {
+    log.info("Auth flow already in progress — waiting for it to complete")
+    return _authInProgress
+  }
+
+  log.info("No valid cached token — triggering full auth flow", { method: cfg.auth_method })
+  _authInProgress = fetchFreshToken(cfg).finally(() => { _authInProgress = null })
+  return _authInProgress
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -521,8 +654,19 @@ function buildAuthUrl(cfg: OciAuthConfig, redirectUri: string, state: string): s
 }
 
 function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open"
-  exec(`${cmd} "${url}"`, err => { if (err) log.warn("Could not open browser", safeStr(err)) })
+  if (process.platform === "darwin") {
+    exec(`open "${url}"`, err => { if (err) log.warn("Could not open browser", safeStr(err)) })
+  } else if (process.platform === "win32") {
+    // Use PowerShell Start-Process — opens the URL in the default browser
+    // with no CMD window appearing. Escape single quotes in the URL.
+    const escaped = url.replace(/'/g, "''")
+    exec(
+      `powershell -NoProfile -WindowStyle Hidden -Command "Start-Process '${escaped}'"`,
+      err => { if (err) log.warn("Could not open browser via PowerShell", safeStr(err)) }
+    )
+  } else {
+    exec(`xdg-open "${url}"`, err => { if (err) log.warn("Could not open browser", safeStr(err)) })
+  }
 }
 
 // ── 5b  Device Authorization Grant (mobile_app) ──────────────────────────────
@@ -618,7 +762,15 @@ async function postForToken(url: string, headers: Record<string, string>, body: 
 // ─────────────────────────────────────────────────────────────────────────────
 
 function stripJsonComments(raw: string): string {
-  return raw.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").trim()
+  // Handles both full-line and inline // comments, and /* */ block comments.
+  // Preserves // and /* inside string literals by matching quoted strings first.
+  // Pattern: match a string literal (keep it) OR a comment (drop it).
+  return raw
+    .replace(
+      /("(?:[^"\\]|\\.)*")|\/\/[^\r\n]*|\/\*[\s\S]*?\*\//g,
+      (_, str) => str ?? ""   // keep string literals, drop comments
+    )
+    .trim()
 }
 function randomState(): string {
   return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
@@ -666,27 +818,48 @@ function htmlReply(res: ServerResponse, status: number, msg: string): void {
 
 export const OciOidcPlugin: Plugin = async ({ project, client }) => {
 
-  const cfg = loadConfig(project.worktree)
+  // project.worktree can be empty on Windows — fall back to process.cwd()
+  const projectPath = project.worktree || process.cwd()
+
+  // Always log startup diagnostics at INFO — appears in the log file even when
+  // config is missing, so users can confirm which version is actually running.
+  const startupMsg =
+    `[oci-auth] Starting v${PLUGIN_VERSION}\n` +
+    `  plugin dir  : ${pluginRoot}\n` +
+    `  log file    : ${_logFile}\n` +
+    `  project dir : ${projectPath}\n` +
+    `  platform    : ${process.platform}\n` +
+    `  node        : ${process.version}\n` +
+    `  home        : ${homedir()}\n` +
+    `  NODE_TLS_REJECT_UNAUTHORIZED : ${process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "(not set)"}`
+  writeLog("INFO", startupMsg)
+  // _ocClient is not set yet (initLogger runs after config loads), so writeLog
+  // above only reaches the disk file. Forward explicitly to the OpenCode console.
+  await client.app.log({ body: { service: "oci-auth", level: "info", message: startupMsg } }).catch(() => {})
+
+  const cfg = loadConfig(projectPath)
   if (!cfg) {
-    writeLog("WARN", "No OCI auth config found — plugin inactive. Create oci-auth.config.jsonc next to the plugin.")
-    await client.app.log({ body: { service: "oci-auth", level: "warn", message: "No OCI auth config found — plugin inactive." } })
+    writeLog("ERROR", "Plugin inactive — no valid OCI auth config found (see above for searched paths).")
+    await client.app.log({ body: { service: "oci-auth", level: "error", message: "No OCI auth config found — plugin inactive. Check the log for the full list of searched paths." } })
     return {}
   }
 
-  initLogger(cfg)
+  initLogger(cfg, client)
   _memCache = null
   const maskStr = (k: string) =>
         !k || k.trim() === "" ? "(none)" : k.length <= 16 ? k : `${k.slice(0, 8)}…${k.slice(-8)}`
 
-  log.info("Plugin initialised", {
+  log.info(`Plugin initialised v${PLUGIN_VERSION}`, {
+    version: PLUGIN_VERSION,
     auth_method: cfg.auth_method, log_level: cfg.log_level,
     log_file: _logFile, domain: cfg.domain_url,
+    llm_base_url: cfg.llm_base_url,
     cache_path: CACHE_PATH,
     client_id: maskStr(cfg.client_id)
   })
 
   await client.app.log({ body: { service: "oci-auth", level: "info",
-    message: `OCI auth plugin ready | method: ${cfg.auth_method} | domain: ${cfg.domain_url}` } })
+    message: `OCI auth plugin ready v${PLUGIN_VERSION} | method: ${cfg.auth_method} | llm_base_url: ${cfg.llm_base_url} | domain: ${cfg.domain_url}` } })
 
   // Warm memory cache from disk. If auth_on_startup is true, also fetch fresh.
   const disk = readDiskCache()
@@ -762,14 +935,11 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
         }
 
         if (cached) {
-          log.debug("Auth loader: returning cached token", { tail: cached.slice(-8) })
+          log.info("Auth loader: returning cached token + baseURL", { baseURL: cfg.llm_base_url, tail: cached.slice(-8) })
           return { apiKey: cached, ...baseFields }
         }
 
-        log.info(
-          "Auth loader: no cached token at startup — returning baseURL only. " +
-          "First user message will trigger auth via chat.params hook."
-        )
+        log.info("Auth loader: no cached token — returning baseURL only", { baseURL: cfg.llm_base_url })
         return baseFields
       },
 
@@ -818,6 +988,15 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
               internalUrl, listenPort, state, authUrl, cfg.browser_timeout_seconds
             )
 
+            // tokenPromise: resolves when code is exchanged for a token.
+            // Stored in _authInProgress so chat.params can wait on this flow
+            // instead of independently calling openBrowser() and opening a second window.
+            const tokenPromise = codePromise.then(code => {
+              log.debug("authorize(): auth code received — exchanging for token")
+              return exchangeCodeForToken(cfg, code, publicRedirectUri)
+            })
+            _authInProgress = tokenPromise.finally(() => { _authInProgress = null })
+
             log.info("authorize(): returning OCI auth URL", { authUrl })
 
             return {
@@ -825,11 +1004,9 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
               url:          authUrl,        // OpenCode opens this in the browser
               instructions: "Complete OCI login in your browser, then return here",
               async callback() {
-                log.debug("authorize.callback() invoked — awaiting auth code")
+                log.debug("authorize.callback() invoked — awaiting token")
                 try {
-                  const code  = await codePromise
-                  log.debug("authorize.callback() got auth code — exchanging for token")
-                  const token = await exchangeCodeForToken(cfg, code, publicRedirectUri)
+                  const token = await tokenPromise
                   log.info("authorize.callback() browser flow completed successfully")
                   return { type: "success" as const, provider: "oci-oidc",
                            key: "apiKey", metadata: { apiKey: token } }
@@ -905,18 +1082,18 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
               log.info("session.error: silent token refresh succeeded", { tail: token.slice(-8) })
             } else {
               log.warn(
-                "session.error: no refresh_token available — user must run /connect to re-authenticate"
+                "session.error: no refresh_token available — user must re-authenticate (send any message to trigger auth)"
               )
             }
           }).catch(err => {
             log.error(
-              "session.error: silent refresh failed — user must run /connect to re-authenticate",
+              "session.error: silent refresh failed — user must re-authenticate (send any message to trigger auth)",
               String(err)
             )
           })
 
           await client.app.log({ body: { service: "oci-auth", level: "warn",
-            message: "OCI token expired or rejected — refreshing automatically. If the next message also fails, run /connect." }
+            message: "OCI token expired or rejected — refreshing automatically. If the next message also fails, send it again to re-authenticate." }
           }).catch(() => {})
         } else {
           await client.app.log({ body: { service: "oci-auth", level: "error",
@@ -941,7 +1118,7 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
             `session.created: no cached token — auth will trigger automatically on first user message`
           )
           await client.app.log({ body: { service: "oci-auth", level: "info",
-            message: `OCI auth pending (method: ${cfg.auth_method}) — send any message to authenticate` }
+            message: `OCI auth pending (method: ${cfg.auth_method}) — a browser will open when you send your first message` }
           }).catch(() => {})
         }
       }
@@ -961,15 +1138,9 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
     },
 
     // ── Per-request auth gate ─────────────────────────────────────────────────
-    //
-    // chat.params output = { temperature, topP, topK, maxOutputTokens, options }
-    // There is NO apiKey in the output — Bearer token injection belongs in
-    // chat.headers (see below).  This hook only decides whether to let the
-    // request proceed or block it with a user-facing error.
-    //
-    // Logic:
-    //   1. Valid token in our cache → let through (chat.headers will inject it).
-    //   2. No token → block with clear message; never send empty credentials.
+    // Triggers auth inline when no token is cached. The mutex in getToken()
+    // ensures only one browser/device flow runs at a time regardless of how
+    // many concurrent requests arrive.
     // ─────────────────────────────────────────────────────────────────────────
     "chat.params": async (_input: unknown, _output: unknown) => {
       const cached = getCachedToken()
@@ -978,17 +1149,15 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
         return
       }
 
-      // No token — block the request entirely with a clear user-facing message.
-      const errMsg =
-        `[oci-auth:chat.params] OCI authentication required — no token available.\n` +
-        `Run /connect in opencode to authenticate` +
-        (cfg.auth_method === "mobile_app"
-          ? " (you will be shown a code to enter in the OCI Mobile Authenticator app)"
-          : " (a browser window will open for OCI login)") +
-        `, then resend your message.`
-
-      log.warn("BLOCKING request — " + errMsg)
-      throw new Error(errMsg)
+      log.info("chat.params: no token — triggering auth flow", { method: cfg.auth_method })
+      try {
+        await getToken(cfg)
+        log.info("chat.params: auth completed — request will proceed")
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        log.error("chat.params: auth failed — blocking request", errMsg)
+        throw new Error(`[oci-auth] Authentication failed: ${errMsg}`)
+      }
     },
 
     // ── Bearer token injection ────────────────────────────────────────────────

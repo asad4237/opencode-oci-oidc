@@ -55,6 +55,12 @@
   // Log file path.  ~ is expanded.  null → platform default:
   //   Linux/macOS:  ~/oci-oidc-debug.log
   //   Windows:      %LOCALAPPDATA%\opencode-oci-oidc\plugin.log
+  //
+  // WINDOWS USERS: JSON does not allow single backslashes in strings.
+  // Use forward slashes (recommended) or double backslashes:
+  //   GOOD: "C:/Users/you/oci-auth.log"
+  //   GOOD: "C:\\Users\\you\\oci-auth.log"
+  //   BAD:  "C:\Users\you\oci-auth.log"   ← will cause a JSON parse error
   "log_file": null,
 
   "browser_timeout_seconds": 120,
