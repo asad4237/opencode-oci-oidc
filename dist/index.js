@@ -149,7 +149,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const pluginRoot = join(__dirname, "..");
 // Read version from package.json at module load so it's always in sync with npm.
-let PLUGIN_VERSION = "unknown";
+let PLUGIN_VERSION = "unknown"; // loaded from package.json at runtime
 try {
     const pkg = JSON.parse(readFileSync(join(pluginRoot, "package.json"), "utf8"));
     PLUGIN_VERSION = pkg.version ?? "unknown";
@@ -239,6 +239,7 @@ function loadConfig(projectPath) {
             // Strategy 1: flat root-level config (merged format or legacy oci-oidc.jsonc)
             if (REQUIRED_AUTH_FIELDS.every(k => parsed[k])) {
                 writeLog("DEBUG", "Config loaded (flat format)", p);
+                _configPath = p;
                 return { ...BEHAVIOUR_DEFAULTS, ...parsed };
             }
             // Strategy 2: "oci_oidc" top-level key
@@ -246,6 +247,7 @@ function loadConfig(projectPath) {
             if (inner && typeof inner === "object" &&
                 REQUIRED_AUTH_FIELDS.every(k => inner[k])) {
                 writeLog("DEBUG", "Config loaded (oci_oidc key)", p);
+                _configPath = p;
                 return { ...BEHAVIOUR_DEFAULTS, ...inner };
             }
             // Strategy 3: provider["oci-oidc"].options
@@ -254,6 +256,7 @@ function loadConfig(projectPath) {
             if (provOpts && typeof provOpts === "object" &&
                 REQUIRED_AUTH_FIELDS.every(k => provOpts[k])) {
                 writeLog("DEBUG", "Config loaded (provider.oci-oidc.options)", p);
+                _configPath = p;
                 return { ...BEHAVIOUR_DEFAULTS, ...provOpts };
             }
             writeLog("DEBUG", "Config file found but missing required fields — skipping", {
@@ -322,6 +325,19 @@ let _memCache = null;
 // Auth-flow mutex: if a browser/device flow is already in progress, all
 // concurrent chat.params calls wait for it rather than opening more windows.
 let _authInProgress = null;
+// Port currently bound by the OAuth callback server (set on listen, cleared on close).
+// Used by fetchTokenBrowserFlow to detect that authorize() already started a server
+// and avoid an EADDRINUSE by waiting for the existing flow instead of rebinding.
+let _callbackServerPort = null;
+// Prevent the startup banner from printing more than once per process even
+// though OpenCode calls the plugin factory multiple times on startup.
+let _startupDone = false;
+// LLM health check runs once after the first valid token is available.
+// _pendingHealthCheck lets chat.params await it rather than racing ahead.
+let _healthCheckDone = false;
+let _pendingHealthCheck = null;
+// Path of the config file that was successfully loaded (set by loadConfig).
+let _configPath = "(unknown)";
 // Timestamp (ms) of the most-recent session.created event.
 // Used to distinguish OpenCode's automatic startup probe requests (which fire
 // within ~100 ms of session.created) from real user-initiated LLM requests.
@@ -476,6 +492,21 @@ async function fetchTokenBrowserFlow(cfg) {
     const publicRedirectUri = cfg.browser_redirect_uri ?? internalUri;
     const state = randomState();
     const authUrl = buildAuthUrl(cfg, publicRedirectUri, state);
+    // If authorize() already started a callback server on this port, wait for that
+    // existing auth flow to complete rather than trying to rebind (which would EADDRINUSE).
+    if (_callbackServerPort === listenPort) {
+        log.info("fetchTokenBrowserFlow: callback server already running — waiting for existing auth to complete", { port: listenPort });
+        const deadline = Date.now() + cfg.browser_timeout_seconds * 1000;
+        while (Date.now() < deadline) {
+            await sleep(2000);
+            const cached = getCachedToken();
+            if (cached) {
+                log.info("fetchTokenBrowserFlow: token received from existing auth flow");
+                return cached;
+            }
+        }
+        throw new Error(`[oci-auth] Timed out waiting for existing OAuth callback on port ${listenPort}`);
+    }
     log.info("Opening browser for OCI auth", { listenPort, publicRedirectUri });
     log.debug("Auth URL", authUrl);
     openBrowser(authUrl);
@@ -492,7 +523,12 @@ function startCallbackServer(callbackUrl, port, expectedState, authUrl, timeoutS
     let rejectCode;
     const codePromise = new Promise((res, rej) => { resolveCode = res; rejectCode = rej; });
     let timer;
-    const done = (fn) => { clearTimeout(timer); server.close(); fn(); };
+    const done = (fn) => {
+        clearTimeout(timer);
+        _callbackServerPort = null; // port is free again
+        server.close();
+        fn();
+    };
     const server = createServer((_req, res) => {
         const req = _req;
         if (!req.url) {
@@ -530,7 +566,10 @@ function startCallbackServer(callbackUrl, port, expectedState, authUrl, timeoutS
         done(() => resolveCode(code));
     });
     server.on("error", (err) => done(() => rejectCode(new Error(`[oci-auth] Callback server: ${err.message}`))));
-    server.listen(port, () => log.debug("Callback server listening", { port }));
+    server.listen(port, () => {
+        _callbackServerPort = port;
+        log.debug("Callback server listening", { port });
+    });
     timer = setTimeout(() => {
         server.close();
         rejectCode(new Error(`[oci-auth] Browser auth timed out after ${timeoutSec}s.\n` +
@@ -720,25 +759,292 @@ function htmlReply(res, status, msg) {
     res.end(`<html><body><h2>${msg}</h2></body></html>`);
 }
 // ─────────────────────────────────────────────────────────────────────────────
+// § 6b — Debug logging proxy
+// When debug_proxy:true, starts a local HTTP reverse proxy on localhost:8890
+// (port configurable via debug_proxy_port). OpenCode is redirected to this
+// proxy via auth.loader returning baseURL=http://localhost:PORT. The proxy
+// logs every request body and response body at INFO level, then forwards to
+// the real LLM endpoint with the Bearer token injected.
+//
+// Additionally, if disable_thinking:true, the proxy injects
+// "enable_thinking":false into every POST request body before forwarding,
+// which disables chain-of-thought mode on vLLM/SGLang servers without
+// requiring a server config change.
+// ─────────────────────────────────────────────────────────────────────────────
+let _proxyPort = null; // set once proxy is started
+function startDebugProxy(cfg, getTokenFn) {
+    const port = cfg.debug_proxy_port ?? 8890;
+    const baseTarget = cfg.llm_base_url.replace(/\/$/, "");
+    const server = createServer((req, res) => {
+        writeLog("INFO", `Proxy: request received — ${req.method} ${req.url}`);
+        handleProxyRequest(cfg, baseTarget, getTokenFn, req, res).catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            writeLog("WARN", `Proxy: handler error — ${msg}`);
+            if (!res.headersSent)
+                res.writeHead(502);
+            res.end(`Proxy error: ${msg}`);
+        });
+    });
+    server.on("connection", (sock) => {
+        writeLog("DEBUG", `Proxy: TCP connection from ${sock.remoteAddress ?? "?"}:${sock.remotePort ?? "?"}`);
+    });
+    server.on("error", (err) => {
+        writeLog("ERROR", `Proxy: server error — ${err.message}`);
+    });
+    server.listen(port, "127.0.0.1", () => {
+        writeLog("INFO", `Proxy: listening on http://127.0.0.1:${port} → ${cfg.llm_base_url}`);
+    });
+    return port;
+}
+async function handleProxyRequest(cfg, baseTarget, getTokenFn, req, res) {
+    // Collect request body
+    const chunks = [];
+    await new Promise(resolve => {
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => resolve());
+    });
+    let bodyBuf = Buffer.concat(chunks);
+    let bodyStr = bodyBuf.toString("utf8");
+    log.info("Proxy →", {
+        method: req.method,
+        path: req.url,
+        body: bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + "…" : bodyStr,
+    });
+    // Optionally inject enable_thinking:false into every POST request
+    if (cfg.disable_thinking && req.method === "POST" && bodyStr.trim().startsWith("{")) {
+        try {
+            const parsed = JSON.parse(bodyStr);
+            if (!("enable_thinking" in parsed)) {
+                parsed["enable_thinking"] = false;
+                bodyStr = JSON.stringify(parsed);
+                bodyBuf = Buffer.from(bodyStr, "utf8");
+                log.debug("Proxy: injected enable_thinking:false");
+            }
+        }
+        catch { /* non-JSON body — leave as-is */ }
+    }
+    const token = getTokenFn();
+    const targetUrl = baseTarget + (req.url ?? "");
+    try {
+        const hasBody = bodyBuf.length > 0 && req.method !== "GET" && req.method !== "HEAD";
+        const upstream = await fetch(targetUrl, {
+            method: req.method ?? "GET",
+            headers: {
+                "content-type": req.headers["content-type"] ?? "application/json",
+                "accept": req.headers["accept"] ?? "*/*",
+                "authorization": token ? `Bearer ${token}` : (req.headers["authorization"] ?? ""),
+                ...(hasBody ? { "content-length": String(bodyBuf.length) } : {}),
+            },
+            body: hasBody ? bodyBuf : undefined,
+            duplex: hasBody ? "half" : undefined,
+        });
+        // Forward response headers, skip content-encoding to avoid double-decode
+        const fwdHeaders = {};
+        upstream.headers.forEach((v, k) => {
+            if (k !== "content-encoding")
+                fwdHeaders[k] = v;
+        });
+        res.writeHead(upstream.status, fwdHeaders);
+        // Stream response back to OpenCode and capture for logging
+        const respChunks = [];
+        if (upstream.body) {
+            const reader = upstream.body.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done)
+                    break;
+                const chunk = Buffer.from(value);
+                respChunks.push(chunk);
+                res.write(chunk);
+            }
+        }
+        res.end();
+        const respStr = Buffer.concat(respChunks).toString("utf8");
+        log.info("Proxy ←", {
+            status: upstream.status,
+            body: respStr.length > 4000 ? respStr.slice(0, 4000) + "…" : respStr,
+        });
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn("Proxy: upstream error", msg);
+        if (!res.headersSent)
+            res.writeHead(502);
+        res.end(`Proxy upstream error: ${msg}`);
+    }
+}
+async function runHealthCheck(cfg, token, client) {
+    const modelsUrl = `${cfg.llm_base_url}/models`;
+    let firstModelId = null;
+    // Step 1 — GET /models
+    try {
+        log.debug("Health check: GET /models", { url: modelsUrl });
+        const res = await fetch(modelsUrl, {
+            method: "GET",
+            headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(10_000),
+        });
+        if (res.ok) {
+            const data = await res.json().catch(() => null);
+            const models = (data && typeof data === "object" && "data" in data && Array.isArray(data.data))
+                ? data.data : null;
+            firstModelId = models?.[0]?.id ?? null;
+            const ids = models ? models.map(m => m.id).join(", ") : "(could not parse)";
+            log.info("Health check: /models OK", { status: res.status, available_models: ids });
+            await client.app.log({ body: { service: "oci-auth", level: "info",
+                    message: `LLM endpoint OK — available models: ${ids}` } }).catch(() => { });
+        }
+        else {
+            const body = await res.text().catch(() => "");
+            log.warn("Health check: /models error", { status: res.status, body: body.slice(0, 400) });
+            await client.app.log({ body: { service: "oci-auth", level: "error",
+                    message: `LLM /models HTTP ${res.status} — ${body.slice(0, 300) || "no body"}` } }).catch(() => { });
+            return;
+        }
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn("Health check: LLM endpoint unreachable", { error: msg, url: modelsUrl });
+        await client.app.log({ body: { service: "oci-auth", level: "error",
+                message: `LLM endpoint unreachable: ${msg}` } }).catch(() => { });
+        return;
+    }
+    // Step 2 — POST /chat/completions to verify a specific model
+    const modelToProbe = cfg.model ?? firstModelId;
+    if (!modelToProbe) {
+        log.warn("Health check: no models returned by /models — cannot probe chat/completions");
+        return;
+    }
+    // Step 2 — streaming probe: matches how OpenCode actually calls the model.
+    // Reads SSE chunks and checks whether any chunk delivers non-empty delta.content.
+    // A 200 response with only empty deltas (thinking/reasoning mode) is reported
+    // as a WARNING so the problem surfaces before the user sends their first message.
+    const completionsUrl = `${cfg.llm_base_url}/chat/completions`;
+    try {
+        log.debug("Health check: POST /chat/completions (stream:true)", { url: completionsUrl, model: modelToProbe });
+        const res = await fetch(completionsUrl, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+                model: modelToProbe,
+                messages: [{ role: "user", content: "Say one word." }],
+                max_tokens: 10,
+                stream: true,
+            }),
+            signal: AbortSignal.timeout(20_000),
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            log.warn("Health check: model probe failed", { status: res.status, model: modelToProbe, body: body.slice(0, 400) });
+            await client.app.log({ body: { service: "oci-auth", level: "error",
+                    message: `Model "${modelToProbe}" rejected HTTP ${res.status} — ${body.slice(0, 200) || "no body"}` } }).catch(() => { });
+            return;
+        }
+        // Read SSE stream and check for non-empty delta.content in any chunk
+        let gotContent = false;
+        const rawChunks = [];
+        if (res.body) {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done)
+                    break;
+                const text = decoder.decode(value, { stream: true });
+                rawChunks.push(text);
+                // Parse SSE lines: "data: {...}"
+                for (const line of text.split("\n")) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith("data:"))
+                        continue;
+                    const jsonStr = trimmed.slice(5).trim();
+                    if (jsonStr === "[DONE]")
+                        continue;
+                    try {
+                        const chunk = JSON.parse(jsonStr);
+                        const content = chunk.choices?.[0]?.delta?.content;
+                        if (content && content.length > 0) {
+                            gotContent = true;
+                            break;
+                        }
+                    }
+                    catch { /* skip unparseable chunk */ }
+                }
+                if (gotContent) {
+                    reader.cancel().catch(() => { });
+                    break;
+                }
+            }
+        }
+        const rawSample = rawChunks.join("").slice(0, 600);
+        if (gotContent) {
+            log.info("Health check: streaming model probe OK — content received", { model: modelToProbe });
+            await client.app.log({ body: { service: "oci-auth", level: "info",
+                    message: `Model "${modelToProbe}" OK — streaming content received` } }).catch(() => { });
+        }
+        else {
+            log.warn("Health check: model returned HTTP 200 but delta.content was empty in all chunks.\n" +
+                "  This usually means the LLM server has thinking/reasoning mode enabled.\n" +
+                "  The model outputs to a non-standard field (e.g. delta.reasoning_content) instead of delta.content.\n" +
+                "  OpenCode reads delta.content → gets nothing → shows blank response.\n" +
+                "  Fix: revert whatever config change enabled thinking/reasoning mode on the LLM server.\n" +
+                `  Raw stream sample: ${rawSample}`);
+            await client.app.log({ body: { service: "oci-auth", level: "error",
+                    message: `Model "${modelToProbe}" WARNING: streaming response has empty delta.content — thinking mode likely enabled on LLM server. OpenCode will show blank responses.` } }).catch(() => { });
+        }
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn("Health check: model probe error", { error: msg, model: modelToProbe });
+    }
+    // Step 3 — if model was not configured, print curl commands and suggest adding it
+    if (!cfg.model && modelToProbe) {
+        const body = JSON.stringify({
+            model: modelToProbe,
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 5,
+        });
+        const winBody = body.replace(/"/g, '\\"');
+        log.info(`Health check: 'model' not set in config — using first discovered model "${modelToProbe}" for probe.\n` +
+            `  To enable per-model health checks and avoid this message, add to your config:\n` +
+            `    File : ${_configPath}\n` +
+            `    Add  : "model": "${modelToProbe}"\n\n` +
+            `  To test the model directly from the command line:\n` +
+            `  Linux/macOS:\n` +
+            `    curl -sk -H "Authorization: Bearer ${token}" \\\n` +
+            `         -H "Content-Type: application/json" \\\n` +
+            `         -d '${body}' \\\n` +
+            `         ${completionsUrl}\n\n` +
+            `  Windows:\n` +
+            `    curl.exe -sk -H "Authorization: Bearer ${token}" ^\n` +
+            `             -H "Content-Type: application/json" ^\n` +
+            `             -d "${winBody}" ^\n` +
+            `             ${completionsUrl}`);
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 // § 7 — Plugin export
 // ─────────────────────────────────────────────────────────────────────────────
 export const OciOidcPlugin = async ({ project, client }) => {
     // project.worktree can be empty on Windows — fall back to process.cwd()
     const projectPath = project.worktree || process.cwd();
-    // Always log startup diagnostics at INFO — appears in the log file even when
-    // config is missing, so users can confirm which version is actually running.
-    const startupMsg = `[oci-auth] Starting v${PLUGIN_VERSION}\n` +
-        `  plugin dir  : ${pluginRoot}\n` +
-        `  log file    : ${_logFile}\n` +
-        `  project dir : ${projectPath}\n` +
-        `  platform    : ${process.platform}\n` +
-        `  node        : ${process.version}\n` +
-        `  home        : ${homedir()}\n` +
-        `  NODE_TLS_REJECT_UNAUTHORIZED : ${process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "(not set)"}`;
-    writeLog("INFO", startupMsg);
-    // _ocClient is not set yet (initLogger runs after config loads), so writeLog
-    // above only reaches the disk file. Forward explicitly to the OpenCode console.
-    await client.app.log({ body: { service: "oci-auth", level: "info", message: startupMsg } }).catch(() => { });
+    // OpenCode calls the plugin factory multiple times on startup — only print
+    // the banner and run one-time init on the first call.
+    if (!_startupDone) {
+        _startupDone = true;
+        const startupMsg = `Starting v${PLUGIN_VERSION}\n` +
+            `  plugin dir  : ${pluginRoot}\n` +
+            `  log file    : ${_logFile}\n` +
+            `  project dir : ${projectPath}\n` +
+            `  platform    : ${process.platform}\n` +
+            `  node        : ${process.version}\n` +
+            `  home        : ${homedir()}\n` +
+            `  NODE_TLS_REJECT_UNAUTHORIZED : ${process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "(not set)"}`;
+        writeLog("INFO", startupMsg);
+        // _ocClient is not set yet (initLogger runs after config loads), so writeLog
+        // above only reaches the disk file. Forward explicitly to the OpenCode console.
+        await client.app.log({ body: { service: "oci-auth", level: "info", message: startupMsg } }).catch(() => { });
+    }
     const cfg = loadConfig(projectPath);
     if (!cfg) {
         writeLog("ERROR", "Plugin inactive — no valid OCI auth config found (see above for searched paths).");
@@ -748,11 +1054,16 @@ export const OciOidcPlugin = async ({ project, client }) => {
     initLogger(cfg, client);
     _memCache = null;
     const maskStr = (k) => !k || k.trim() === "" ? "(none)" : k.length <= 16 ? k : `${k.slice(0, 8)}…${k.slice(-8)}`;
+    // Start debug proxy on first init only (it binds a port — can't rebind)
+    if (cfg.debug_proxy && _proxyPort === null) {
+        _proxyPort = startDebugProxy(cfg, getCachedToken);
+    }
     log.info(`Plugin initialised v${PLUGIN_VERSION}`, {
         version: PLUGIN_VERSION,
         auth_method: cfg.auth_method, log_level: cfg.log_level,
         log_file: _logFile, domain: cfg.domain_url,
         llm_base_url: cfg.llm_base_url,
+        ...(cfg.debug_proxy ? { debug_proxy: `http://127.0.0.1:${_proxyPort}` } : {}),
         cache_path: CACHE_PATH,
         client_id: maskStr(cfg.client_id)
     });
@@ -763,6 +1074,13 @@ export const OciOidcPlugin = async ({ project, client }) => {
     if (isCacheValid(disk)) {
         _memCache = disk;
         log.info("Valid cached token loaded from disk — no auth needed at startup");
+        // Token is available immediately — kick off health check now so results
+        // are ready before the user sends their first message.
+        if (!_healthCheckDone) {
+            _healthCheckDone = true;
+            _pendingHealthCheck = runHealthCheck(cfg, disk.access_token, client)
+                .finally(() => { _pendingHealthCheck = null; });
+        }
     }
     else if (cfg.auth_on_startup) {
         log.info("auth_on_startup=true — prefetching token in background");
@@ -820,17 +1138,22 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 log.debug("Auth loader invoked (startup — result will be cached by OpenCode)");
                 const cached = getCachedToken();
                 // Always include baseURL — without it OpenCode builds "undefined/chat/completions".
+                // If debug_proxy is active, redirect OpenCode to the local proxy so all
+                // traffic is logged (and optionally transformed) before reaching the LLM.
+                const effectiveBase = (_proxyPort !== null)
+                    ? `http://127.0.0.1:${_proxyPort}`
+                    : cfg.llm_base_url;
                 const baseFields = {
-                    baseUrl: cfg.llm_base_url,
-                    baseURL: cfg.llm_base_url,
+                    baseUrl: effectiveBase,
+                    baseURL: effectiveBase,
                     instanceUrl: cfg.domain_url,
                     clientId: cfg.client_id,
                 };
                 if (cached) {
-                    log.info("Auth loader: returning cached token + baseURL", { baseURL: cfg.llm_base_url, tail: cached.slice(-8) });
+                    log.info("Auth loader: returning cached token + baseURL", { baseURL: effectiveBase, tail: cached.slice(-8) });
                     return { apiKey: cached, ...baseFields };
                 }
-                log.info("Auth loader: no cached token — returning baseURL only", { baseURL: cfg.llm_base_url });
+                log.info("Auth loader: no cached token — returning baseURL only", { baseURL: effectiveBase });
                 return baseFields;
             },
             methods: [
@@ -906,21 +1229,15 @@ export const OciOidcPlugin = async ({ project, client }) => {
         },
         // ── Events ───────────────────────────────────────────────────────────────
         event: async ({ event }) => {
-            const knownTypes = new Set(["session.created", "session.error", "session.status"]);
-            if (knownTypes.has(event.type)) {
-                log.debug("Event received", event.type);
+            // At VERBOSE level, dump full payload for message events so we can see
+            // exactly what content OpenCode is receiving from the LLM endpoint.
+            const verboseTypes = new Set(["message.part.updated", "message.updated", "message.part.added", "session.status"]);
+            if (verboseTypes.has(event.type)) {
+                log.verbose(`Event: ${event.type}`, safeStr(event));
             }
             else {
-                // Log full payload of unknown events — helps discover new event types.
-                //log.info("Event received (unhandled)", safeStr(event))
                 log.debug("Event received", event.type);
             }
-            // ── session.status ──────────────────────────────────────────────────────
-            // Fires periodically with session health / state info.
-            // Log it fully so we can see what OpenCode reports while we're "stuck".
-            //if (event.type === "session.status") {
-            //        log.info("session.status", safeStr(event))
-            //    }
             if (event.type === "session.error") {
                 log.error("Session error", event);
                 // Check if the error is a 401 / auth failure from the backend.
@@ -980,17 +1297,44 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 // startup probe (fires within ~100 ms of this event) from real user requests.
                 _sessionCreatedAt = Date.now();
                 log.debug("session.created: timestamp recorded", { _sessionCreatedAt });
+                // A new session means any in-flight browser/device auth from a previous
+                // session is dead (user may have closed the browser or the session aborted).
+                // Reset the mutex so the next request starts a fresh auth flow instead of
+                // waiting forever on a Promise that will never resolve.
+                if (_authInProgress) {
+                    log.warn("session.created: clearing stale _authInProgress from previous session");
+                    _authInProgress = null;
+                }
                 const cached = getCachedToken();
+                const disk = _memCache ?? readDiskCache();
                 if (cached) {
-                    log.info("session.created: valid cached token — no auth needed at startup");
+                    const expiresInMin = Math.round(((_memCache ?? disk).expires_at - Date.now()) / 60000);
+                    log.info(`session.created: valid cached token — expires in ~${expiresInMin} min`, {
+                        has_refresh: !!(disk?.refresh_token),
+                    });
                     await client.app.log({ body: { service: "oci-auth", level: "info",
-                            message: "OCI token ready for new session" } }).catch(() => { });
+                            message: `OCI token ready — expires in ~${expiresInMin} min` } }).catch(() => { });
+                }
+                else if (disk?.refresh_token) {
+                    log.info("session.created: access token expired but refresh_token available — will refresh silently on first message");
+                    await client.app.log({ body: { service: "oci-auth", level: "info",
+                            message: "OCI access token expired — will refresh silently on first message" } }).catch(() => { });
                 }
                 else {
-                    log.info(`session.created: no cached token — auth will trigger automatically on first user message`);
+                    log.info("session.created: no cached token — auth will trigger on first message");
                     await client.app.log({ body: { service: "oci-auth", level: "info",
-                            message: `OCI auth pending (method: ${cfg.auth_method}) — a browser will open when you send your first message` }
+                            message: `OCI auth pending (method: ${cfg.auth_method}) — browser will open on first message` }
                     }).catch(() => { });
+                }
+                // Health check runs at plugin init if a token was already cached.
+                // If there was no token at init (auth just completed), start it now.
+                if (!_healthCheckDone) {
+                    const token = getCachedToken();
+                    if (token) {
+                        _healthCheckDone = true;
+                        _pendingHealthCheck = runHealthCheck(cfg, token, client)
+                            .finally(() => { _pendingHealthCheck = null; });
+                    }
                 }
             }
         },
@@ -1009,6 +1353,12 @@ export const OciOidcPlugin = async ({ project, client }) => {
         // many concurrent requests arrive.
         // ─────────────────────────────────────────────────────────────────────────
         "chat.params": async (_input, _output) => {
+            // If a health check is in flight (started at init), wait for it so its
+            // results appear before the first request rather than racing ahead of it.
+            if (_pendingHealthCheck) {
+                log.debug("chat.params: awaiting health check");
+                await Promise.race([_pendingHealthCheck, new Promise(r => setTimeout(r, 8_000))]);
+            }
             const cached = getCachedToken();
             if (cached) {
                 log.debug("chat.params: token in cache — request allowed (chat.headers will inject Bearer)");
