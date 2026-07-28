@@ -14,11 +14,13 @@ cd "$SCRIPT_DIR"
 
 DRY_RUN=false
 BUMP=""
+OTP=""
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     patch|minor|major) BUMP="$arg" ;;
+    --otp=*) OTP="${arg#--otp=}" ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
@@ -99,7 +101,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
   echo "        DRY RUN — skipping actual publish."
   echo "        Would have run: npm publish --access public"
 else
-  npm publish --access public
+  OTP_FLAG=""
+  [[ -n "$OTP" ]] && OTP_FLAG="--otp=$OTP"
+  npm publish --access public $OTP_FLAG
   echo ""
   echo "  Published: https://www.npmjs.com/package/opencode-oci-oidc"
 fi

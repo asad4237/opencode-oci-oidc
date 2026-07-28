@@ -774,10 +774,30 @@ function htmlReply(res, status, msg) {
 let _proxyPort = null; // set once proxy is started
 function startDebugProxy(cfg, getTokenFn) {
     const port = cfg.debug_proxy_port ?? 8890;
-    const baseTarget = cfg.llm_base_url.replace(/\/$/, "");
+    // debug_proxy_target is the REAL backend. Defaults to llm_base_url.
+    // Set this explicitly when you need llm_base_url and the proxy address to differ.
+    const realTarget = (cfg.debug_proxy_target ?? cfg.llm_base_url).replace(/\/$/, "");
+    // Self-loop guard: if the real target resolves to this proxy's own address,
+    // every forwarded request would loop back and append the path repeatedly
+    // (e.g. /api → /api/api → /api/api/api…). Fail loudly instead.
+    const selfOrigins = [
+        `http://127.0.0.1:${port}`,
+        `http://localhost:${port}`,
+        `http://0.0.0.0:${port}`,
+    ];
+    if (selfOrigins.some(o => realTarget.startsWith(o))) {
+        const msg = `[oci-auth] debug_proxy self-loop detected!\n` +
+            `  The proxy would forward to itself (target="${realTarget}", proxy port=${port}).\n` +
+            `  Fix: set "llm_base_url" to the REAL backend (e.g. "https://10.x.x.x/api").\n` +
+            `  If you want OpenCode to connect through the proxy, change "baseURL" in opencode.json\n` +
+            `  to "http://127.0.0.1:${port}" — NOT llm_base_url in oci-auth.config.jsonc.\n` +
+            `  Alternatively, set "debug_proxy_target" to the real backend URL in oci-auth.config.jsonc.`;
+        writeLog("ERROR", msg);
+        throw new Error(msg);
+    }
     const server = createServer((req, res) => {
         writeLog("INFO", `Proxy: request received — ${req.method} ${req.url}`);
-        handleProxyRequest(cfg, baseTarget, getTokenFn, req, res).catch((err) => {
+        handleProxyRequest(cfg, realTarget, getTokenFn, req, res).catch((err) => {
             const msg = err instanceof Error ? err.message : String(err);
             writeLog("WARN", `Proxy: handler error — ${msg}`);
             if (!res.headersSent)
@@ -792,7 +812,7 @@ function startDebugProxy(cfg, getTokenFn) {
         writeLog("ERROR", `Proxy: server error — ${err.message}`);
     });
     server.listen(port, "127.0.0.1", () => {
-        writeLog("INFO", `Proxy: listening on http://127.0.0.1:${port} → ${cfg.llm_base_url}`);
+        writeLog("INFO", `Proxy: listening on http://127.0.0.1:${port} → ${realTarget}`);
     });
     return port;
 }
@@ -810,7 +830,7 @@ async function handleProxyRequest(cfg, baseTarget, getTokenFn, req, res) {
         path: req.url,
         body: bodyStr.length > 4000 ? bodyStr.slice(0, 4000) + "…" : bodyStr,
     });
-    // Optionally inject enable_thinking:false into every POST request
+    // Optionally inject enable_thinking:false
     if (cfg.disable_thinking && req.method === "POST" && bodyStr.trim().startsWith("{")) {
         try {
             const parsed = JSON.parse(bodyStr);
@@ -984,13 +1004,13 @@ async function runHealthCheck(cfg, token, client) {
         }
         else {
             log.warn("Health check: model returned HTTP 200 but delta.content was empty in all chunks.\n" +
-                "  This usually means the LLM server has thinking/reasoning mode enabled.\n" +
-                "  The model outputs to a non-standard field (e.g. delta.reasoning_content) instead of delta.content.\n" +
-                "  OpenCode reads delta.content → gets nothing → shows blank response.\n" +
-                "  Fix: revert whatever config change enabled thinking/reasoning mode on the LLM server.\n" +
+                "  The model is outputting to a non-standard field (e.g. delta.reasoning_content)\n" +
+                "  instead of delta.content. This is expected for reasoning/thinking models.\n" +
+                "  OpenCode reads delta.content — if the model never populates it, responses will appear blank.\n" +
+                "  If this is unintentional, check whether reasoning/thinking mode is enabled on the LLM server.\n" +
                 `  Raw stream sample: ${rawSample}`);
-            await client.app.log({ body: { service: "oci-auth", level: "error",
-                    message: `Model "${modelToProbe}" WARNING: streaming response has empty delta.content — thinking mode likely enabled on LLM server. OpenCode will show blank responses.` } }).catch(() => { });
+            await client.app.log({ body: { service: "oci-auth", level: "warn",
+                    message: `Model "${modelToProbe}" WARNING: streaming response has empty delta.content — model may be a reasoning/thinking model. Responses will appear blank if delta.content is never populated.` } }).catch(() => { });
         }
     }
     catch (err) {
@@ -1137,23 +1157,20 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 // auth state; if none exists it calls authorize() immediately (startup browser).
                 log.debug("Auth loader invoked (startup — result will be cached by OpenCode)");
                 const cached = getCachedToken();
-                // Always include baseURL — without it OpenCode builds "undefined/chat/completions".
-                // If debug_proxy is active, redirect OpenCode to the local proxy so all
-                // traffic is logged (and optionally transformed) before reaching the LLM.
-                const effectiveBase = (_proxyPort !== null)
-                    ? `http://127.0.0.1:${_proxyPort}`
-                    : cfg.llm_base_url;
+                // The endpoint URL (baseURL) comes from opencode.json provider options — the user
+                // controls it there and can point it at the proxy or the real backend as needed.
+                // We deliberately do NOT return baseURL here: returning it would silently override
+                // whatever is in opencode.json, making that setting unreliable.
+                // We only return the credential (apiKey) and identity fields.
                 const baseFields = {
-                    baseUrl: effectiveBase,
-                    baseURL: effectiveBase,
                     instanceUrl: cfg.domain_url,
                     clientId: cfg.client_id,
                 };
                 if (cached) {
-                    log.info("Auth loader: returning cached token + baseURL", { baseURL: effectiveBase, tail: cached.slice(-8) });
+                    log.info("Auth loader: returning cached token", { tail: cached.slice(-8) });
                     return { apiKey: cached, ...baseFields };
                 }
-                log.info("Auth loader: no cached token — returning baseURL only", { baseURL: effectiveBase });
+                log.info("Auth loader: no cached token — returning identity fields only");
                 return baseFields;
             },
             methods: [
@@ -1359,6 +1376,8 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 log.debug("chat.params: awaiting health check");
                 await Promise.race([_pendingHealthCheck, new Promise(r => setTimeout(r, 8_000))]);
             }
+            // Note: _output here contains only model params (temperature, topP, maxOutputTokens, options).
+            // Messages are NOT available in this hook — stripping is done in the proxy instead.
             const cached = getCachedToken();
             if (cached) {
                 log.debug("chat.params: token in cache — request allowed (chat.headers will inject Bearer)");
