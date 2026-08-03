@@ -15,8 +15,8 @@
       "models": {
         "tawn-gpt-oss-120b": {
           "id": "tawn-gpt-oss-120b",
-          "name": "tawn-gpt-oss-120b"//,
-          //"limit": { "context": 131072, "output": 8192 }
+          "name": "tawn-gpt-oss-120b",
+          "limit": { "context": 131072, "output": 65536 }
         }
       }
     }
