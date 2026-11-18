@@ -105,9 +105,13 @@ The plugin automatically injects the `Authorization: Bearer <token>` header into
 
 ### Confidential App (browser)
 
-1. Run `/connect` in OpenCode — a browser window opens to the OCI login page
-2. Complete login; the browser redirects back to `localhost:8888/callback`
-3. The plugin exchanges the code for a token, caches it, and subsequent requests are automatic
+1. Run `/connect` in OpenCode. A browser window opens to the OCI login page, and OpenCode shows the login link with an input box
+2. Sign in. Then either:
+   - **The browser shows "Authentication successful"**: type `ok` in OpenCode and press Enter
+   - **No browser opened, or the page after sign-in fails to load** (SSH session, bastion host, container): open the link yourself, sign in, copy the **full URL** of the `localhost:8888/callback?code=…` page from the address bar, and paste it into OpenCode
+3. The plugin exchanges the code for a token, caches it with the refresh token, and subsequent requests are automatic
+
+A pasted URL must come from the current login attempt (its `state` is checked). You can also paste just the `code` value. Or you can paste an OCI access token (JWT) you obtained elsewhere; it's used until its `exp`, but it can't be refreshed.
 
 ### Mobile App (device flow)
 
@@ -199,7 +203,7 @@ The plugin could not find or read your `oci-auth.config.jsonc`. Steps to diagnos
 
 | Symptom | Fix |
 |---------|-----|
-| Browser doesn't open on `/connect` | Check `redirect_uri` matches what is registered in your OCI Confidential App |
+| Browser doesn't open on `/connect` | Check `redirect_uri` matches what is registered in your OCI Confidential App, or open the link shown in `/connect` yourself and paste the redirect URL back |
 | Token rejected (401) after previously working | Run `oci_oidc_refresh` tool or `/connect` again |
 | Plugin keeps retrying auth silently | Check the log for `session.error` entries — likely a new/changed client secret |
 | Hanging after sending a message | Check log for `Network timeout` — indicates OCI IAM or the LLM endpoint is unreachable |

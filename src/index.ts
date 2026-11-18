@@ -22,7 +22,7 @@ import { tool } from "@opencode-ai/plugin"
 import { exec } from "child_process"
 import { createServer, IncomingMessage, ServerResponse } from "http"
 import { homedir, tmpdir } from "os"
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs"
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, renameSync } from "fs"
 import { join, dirname } from "path"
 import { fileURLToPath } from "url"
 
@@ -407,10 +407,15 @@ let _memCache: TokenCache | null = null
 // concurrent chat.params calls wait for it rather than opening more windows.
 let _authInProgress: Promise<string> | null = null
 
-// Port currently bound by the OAuth callback server (set on listen, cleared on close).
-// Used by fetchTokenBrowserFlow to detect that authorize() already started a server
-// and avoid an EADDRINUSE by waiting for the existing flow instead of rebinding.
-let _callbackServerPort: number | null = null
+// Refresh mutex: concurrent callers (chat.params, shell.env, session.error) share
+// one refresh_token grant. OCI rotates refresh tokens, so a second parallel grant
+// with the same (now consumed) refresh_token would be rejected and sign the user out.
+let _refreshInProgress: Promise<string | null> | null = null
+
+// The OAuth callback server currently owned by this process (if any).
+// A new browser flow cancels it and takes over the port, so a stale server
+// (e.g. from an abandoned authorize()) can never block a fresh login.
+let _activeCallback: { port: number; cancel: (reason: string) => void } | null = null
 
 // Prevent the startup banner from printing more than once per process even
 // though OpenCode calls the plugin factory multiple times on startup.
@@ -448,7 +453,11 @@ function readDiskCache(): TokenCache | null {
 function writeDiskCache(cache: TokenCache): void {
   try {
     mkdirSync(dirname(CACHE_PATH), { recursive: true })
-    writeFileSync(CACHE_PATH, JSON.stringify(cache), "utf8")
+    // Atomic write (tmp + rename): another OpenCode process reading mid-write
+    // would otherwise see truncated JSON, treat it as "no token" and start a login.
+    const tmp = `${CACHE_PATH}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(cache), { encoding: "utf8", mode: 0o600 })
+    renameSync(tmp, CACHE_PATH)
     log.debug("Token written to disk cache")
   } catch (err) {
     log.warn("Could not write disk cache (non-fatal)", safeStr(err))
@@ -458,7 +467,10 @@ function writeDiskCache(cache: TokenCache): void {
 function storeToken(accessToken: string, expiresInSeconds: number, refreshToken?: string, marginSec = 60): string {
   const ttl   = Math.max(expiresInSeconds - marginSec, 60)
   const cache: TokenCache = { access_token: accessToken, expires_at: Date.now() + ttl * 1000 }
-  if (refreshToken) cache.refresh_token = refreshToken
+  // Keep the previous refresh_token if the server did not issue a new one,
+  // otherwise the next expiry would force a full browser login.
+  const prevRefresh = (_memCache ?? readDiskCache())?.refresh_token
+  if (refreshToken ?? prevRefresh) cache.refresh_token = refreshToken ?? prevRefresh
   _memCache = cache
   writeDiskCache(cache)
   log.info("Token cached", { expires_in_s: ttl, tail: accessToken.slice(-8), has_refresh: !!refreshToken })
@@ -478,17 +490,27 @@ function getCachedToken(): string | null {
  * Returns the new access token on success, null if no refresh_token is stored
  * or if the refresh_token itself is expired/rejected.
  */
-async function tryRefreshToken(cfg: OciAuthConfig): Promise<string | null> {
-  const cache = _memCache ?? readDiskCache()
+function tryRefreshToken(cfg: OciAuthConfig): Promise<string | null> {
+  if (!_refreshInProgress) {
+    _refreshInProgress = doRefreshToken(cfg).finally(() => { _refreshInProgress = null })
+  }
+  return _refreshInProgress
+}
+
+async function doRefreshToken(cfg: OciAuthConfig, retried = false): Promise<string | null> {
+  // Always read disk: another OpenCode process may have rotated the refresh_token.
+  const cache = readDiskCache() ?? _memCache
+  if (cache && Date.now() < cache.expires_at) { _memCache = cache; return cache.access_token }
   if (!cache?.refresh_token) {
     log.debug("tryRefreshToken: no refresh_token in cache")
     return null
   }
+  const usedRefresh = cache.refresh_token
   log.info("tryRefreshToken: attempting silent token refresh")
   const url     = `${cfg.domain_url}/oauth2/v1/token`
   const body    = new URLSearchParams({
     grant_type:    "refresh_token",
-    refresh_token: cache.refresh_token,
+    refresh_token: usedRefresh,
   })
   const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }
   if (cfg.client_secret) {
@@ -501,11 +523,26 @@ async function tryRefreshToken(cfg: OciAuthConfig): Promise<string | null> {
     log.info("tryRefreshToken: silent refresh succeeded")
     return token
   } catch (err) {
-    log.warn("tryRefreshToken: refresh_token rejected — will fall back to full auth flow", safeStr(err))
-    // Wipe the stale refresh token so we don't loop on it
-    _memCache = null
-    try { const { unlinkSync: rm } = await import("fs"); rm(CACHE_PATH) } catch { /* ok */ }
-    return null
+    // Another process may have refreshed (and rotated the refresh_token) while we
+    // were in flight — if so, use its result instead of signing the user out.
+    const latest = readDiskCache()
+    if (latest?.refresh_token && latest.refresh_token !== usedRefresh) {
+      log.info("tryRefreshToken: refresh_token was rotated by another process — using its token")
+      if (isCacheValid(latest)) { _memCache = latest; return latest.access_token }
+      if (!retried) return doRefreshToken(cfg, true)
+    }
+
+    // Only discard the refresh_token when OCI actually rejected it (400/401).
+    // Network errors, timeouts and 5xx are transient — keep it for the next try.
+    const status = err instanceof TokenEndpointError ? err.status : undefined
+    if (status === 400 || status === 401) {
+      log.warn("tryRefreshToken: refresh_token rejected — will fall back to full auth flow", safeStr(err))
+      _memCache = null
+      try { unlinkSync(CACHE_PATH) } catch { /* ok */ }
+      return null
+    }
+    log.warn("tryRefreshToken: transient refresh failure — keeping refresh_token", safeStr(err))
+    throw err instanceof Error ? err : new Error(String(err))
   }
 }
 
@@ -527,8 +564,11 @@ async function getToken(cfg: OciAuthConfig): Promise<string> {
   }
 
   log.info("No valid cached token — triggering full auth flow", { method: cfg.auth_method })
-  _authInProgress = fetchFreshToken(cfg).finally(() => { _authInProgress = null })
-  return _authInProgress
+  const inFlight: Promise<string> = fetchFreshToken(cfg).finally(() => {
+    if (_authInProgress === inFlight) _authInProgress = null
+  })
+  _authInProgress = inFlight
+  return inFlight
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -545,6 +585,10 @@ async function fetchFreshToken(cfg: OciAuthConfig): Promise<string> {
     } catch (err) {
       log.error(`total_max_retry_attempts ${cfg.max_retry_attempts} token fetch attempt failed`, safeStr(err))
       lastErr = err
+      // Don't reopen the browser after the user ignored/cancelled a login or
+      // another process holds the callback port — only retry transient errors.
+      const msg = err instanceof Error ? err.message : String(err)
+      if (err instanceof PortBusyError || /Browser auth timed out|Login cancelled|OCI error:/.test(msg)) break
       if (attempt < cfg.max_retry_attempts) {
         const delay = cfg.retry_delay_ms * 2 ** (attempt - 1)
         log.warn(`Token fetch attempt ${attempt}/${cfg.max_retry_attempts} failed — retrying in ${delay}ms`, safeStr(err))
@@ -573,51 +617,77 @@ async function fetchTokenBrowserFlow(cfg: OciAuthConfig): Promise<string> {
   const state  = randomState()
   const authUrl = buildAuthUrl(cfg, publicRedirectUri, state)
 
-  // If authorize() already started a callback server on this port, wait for that
-  // existing auth flow to complete rather than trying to rebind (which would EADDRINUSE).
-  if (_callbackServerPort === listenPort) {
-    log.info("fetchTokenBrowserFlow: callback server already running — waiting for existing auth to complete", { port: listenPort })
+  // Bind the callback port BEFORE opening the browser. Any earlier flow in this
+  // process is cancelled and its port taken over, so a stale server can never
+  // leave us waiting on a login whose browser window never opened.
+  let flow: { codePromise: Promise<string>; cleanup: () => void }
+  try {
+    flow = await startCallbackServer(internalUrl, listenPort, state, authUrl, cfg.browser_timeout_seconds)
+  } catch (err) {
+    if (!(err instanceof PortBusyError)) throw err
+    // Another process (usually a second OpenCode window) is mid-login on this port.
+    // It shares the disk token cache, so wait for it to finish instead of failing.
+    log.warn(err.message)
     const deadline = Date.now() + cfg.browser_timeout_seconds * 1000
     while (Date.now() < deadline) {
       await sleep(2000)
       const cached = getCachedToken()
       if (cached) {
-        log.info("fetchTokenBrowserFlow: token received from existing auth flow")
+        log.info("fetchTokenBrowserFlow: token received from another process's login")
         return cached
       }
     }
-    throw new Error(`[oci-auth] Timed out waiting for existing OAuth callback on port ${listenPort}`)
+    throw err
   }
 
   log.info("Opening browser for OCI auth", { listenPort, publicRedirectUri })
-  log.debug("Auth URL", authUrl)
+  log.warn(
+    `If no browser window opened, open this URL to sign in:\n  ${authUrl}\n` +
+    `  If the redirect can't reach this machine, run /connect and paste the redirect URL there.`
+  )
   openBrowser(authUrl)
 
-  const code = await waitForAuthCode(internalUrl, listenPort, state, authUrl, cfg.browser_timeout_seconds)
+  const code = await flow.codePromise
   log.info("Authorization code received — exchanging for token")
   return exchangeCodeForToken(cfg, code, publicRedirectUri)
 }
 
+class PortBusyError extends Error {}
+
 /**
- * Start callback server but return a promise + cleanup handle instead of awaiting inline.
- * Used by authorize() so the server can run while OpenCode handles the browser.
+ * Bind the OAuth callback server and return a promise for the auth code plus a
+ * cleanup handle. Resolves once the port is listening; rejects with PortBusyError
+ * if another process holds the port.
  */
-function startCallbackServer(
+async function startCallbackServer(
   callbackUrl: URL,
   port: number,
   expectedState: string,
   authUrl: string,
   timeoutSec: number,
-): { codePromise: Promise<string>; cleanup: () => void } {
+  successMsg = "Authentication successful - you may close this window.",
+): Promise<{ codePromise: Promise<string>; cleanup: () => void }> {
+  if (_activeCallback?.port === port) {
+    log.info("Cancelling previous OAuth callback server — starting a fresh login", { port })
+    _activeCallback.cancel("superseded by a newer login attempt")
+  }
+
   let resolveCode!: (code: string) => void
   let rejectCode!:  (err: Error)   => void
   const codePromise = new Promise<string>((res, rej) => { resolveCode = res; rejectCode = rej })
+  // Callers may never await codePromise (e.g. a cancelled authorize() flow).
+  codePromise.catch(() => { /* handled by awaiting callers */ })
 
-  let timer: NodeJS.Timeout
+  let timer: NodeJS.Timeout | undefined
+  let settled = false
+  let handle: NonNullable<typeof _activeCallback> | null = null
   const done = (fn: () => void) => {
+    if (settled) return
+    settled = true
     clearTimeout(timer)
-    _callbackServerPort = null   // port is free again
+    if (_activeCallback === handle) _activeCallback = null   // port is free again
     server.close()
+    server.closeAllConnections?.()
     fn()
   }
 
@@ -637,8 +707,10 @@ function startCallbackServer(
       return
     }
     if (reqUrl.searchParams.get("state") !== expectedState) {
-      htmlReply(res, 400, "State mismatch — possible CSRF. Please retry.")
-      done(() => rejectCode(new Error("[oci-auth] OAuth state mismatch")))
+      // Likely a redirect from an older, superseded login tab — keep waiting
+      // for the current one rather than failing the whole flow.
+      htmlReply(res, 400, "This login link has expired. Please use the most recently opened login window.")
+      log.warn("Callback with stale/unknown state ignored")
       return
     }
     const code = reqUrl.searchParams.get("code")
@@ -647,39 +719,45 @@ function startCallbackServer(
       done(() => rejectCode(new Error("[oci-auth] Callback missing code")))
       return
     }
-    htmlReply(res, 200, "Authentication successful - you may close this window.")
+    htmlReply(res, 200, successMsg)
     log.info("Browser auth callback received")
     done(() => resolveCode(code))
   })
 
+  // The previous server's listening socket may take a moment to release.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await new Promise<void>((res, rej) => {
+        server.once("error", rej)
+        server.listen(port, () => { server.off("error", rej); res() })
+      })
+      break
+    } catch (err) {
+      const errno = (err as NodeJS.ErrnoException).code
+      if (errno === "EADDRINUSE" && attempt < 5) { await sleep(300); continue }
+      if (errno === "EADDRINUSE") {
+        throw new PortBusyError(
+          `[oci-auth] OAuth callback port ${port} is in use by another process ` +
+          `(another OpenCode window mid-login?). Finish or close that login, then retry.`
+        )
+      }
+      throw new Error(`[oci-auth] Callback server: ${(err as Error).message}`)
+    }
+  }
+  log.debug("Callback server listening", { port })
+
   server.on("error", (err: Error) => done(() => rejectCode(new Error(`[oci-auth] Callback server: ${err.message}`))))
-  server.listen(port, () => {
-    _callbackServerPort = port
-    log.debug("Callback server listening", { port })
-  })
+  handle = { port, cancel: (reason: string) => done(() => rejectCode(new Error(`[oci-auth] Login cancelled: ${reason}`))) }
+  _activeCallback = handle
 
-  timer = setTimeout(() => {
-    server.close()
-    rejectCode(new Error(
-      `[oci-auth] Browser auth timed out after ${timeoutSec}s.\n` +
-      `  Navigate manually to: ${authUrl}\n` +
-      `  Then use the oci_oidc_refresh tool to retry.`
-    ))
-  }, timeoutSec * 1000)
+  timer = setTimeout(() => done(() => rejectCode(new Error(
+    `[oci-auth] Browser auth timed out after ${timeoutSec}s.\n` +
+    `  Navigate manually to: ${authUrl}\n` +
+    `  Then use the oci_oidc_refresh tool to retry.\n` +
+    `  On a remote/headless machine, run /connect and paste the redirect URL there.`
+  ))), timeoutSec * 1000)
 
-  return { codePromise, cleanup: () => { clearTimeout(timer); server.close() } }
-}
-
-/** Await version used by fetchTokenBrowserFlow (direct call path). */
-function waitForAuthCode(
-  callbackUrl: URL,
-  port: number,
-  expectedState: string,
-  authUrl: string,
-  timeoutSec: number,
-): Promise<string> {
-  const { codePromise } = startCallbackServer(callbackUrl, port, expectedState, authUrl, timeoutSec)
-  return codePromise
+  return { codePromise, cleanup: () => handle!.cancel("cleanup") }
 }
 
 async function exchangeCodeForToken(cfg: OciAuthConfig, code: string, redirectUri: string): Promise<string> {
@@ -694,6 +772,48 @@ async function exchangeCodeForToken(cfg: OciAuthConfig, code: string, redirectUr
   }
   log.debug("Exchanging code for token", { url, hasSecret: !!cfg.client_secret })
   return postForToken(url, headers, body)
+}
+
+/**
+ * Interpret what the user pasted in the manual flow. Accepts:
+ *   - the full redirect URL from the browser address bar (state is verified)
+ *   - just the authorization code
+ *   - an OCI access token (JWT) obtained elsewhere
+ */
+function parsePastedAuthInput(raw: string, expectedState: string): { code: string } | { accessToken: string } {
+  const input = raw.trim().replace(/^["']|["']$/g, "")
+  if (!input) throw new Error("[oci-auth] Nothing was pasted")
+
+  if (/^https?:\/\//i.test(input) || input.includes("code=")) {
+    const query  = /^https?:\/\//i.test(input) ? new URL(input).search : input.slice(input.indexOf("?") + 1)
+    const params = new URLSearchParams(query)
+    const error  = params.get("error")
+    if (error) throw new Error(`[oci-auth] OCI error: ${params.get("error_description") ?? error}`)
+    const code = params.get("code")
+    if (!code) throw new Error("[oci-auth] Pasted URL has no code= parameter")
+    const state = params.get("state")
+    if (state && state !== expectedState) {
+      throw new Error("[oci-auth] Pasted URL is from a different login attempt (state mismatch) — use the latest URL")
+    }
+    return { code }
+  }
+  if (/^eyJ[\w-]*\.[\w-]+\.[\w-]*$/.test(input)) return { accessToken: input }
+  return { code: input }
+}
+
+/** Cache a pasted access token, using its JWT exp claim when present. No refresh_token. */
+function storePastedAccessToken(token: string): string {
+  let expiresIn = 3600
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")) as { exp?: number }
+    if (payload.exp) expiresIn = payload.exp - Math.floor(Date.now() / 1000)
+  } catch { /* not decodable — assume 1h */ }
+  if (expiresIn <= 0) throw new Error("[oci-auth] Pasted access token is already expired")
+  log.warn("Using pasted access token — it cannot be refreshed; you'll need to log in again when it expires")
+  // Don't carry over an old refresh_token: it belongs to a different session.
+  _memCache = null
+  try { unlinkSync(CACHE_PATH) } catch { /* ok */ }
+  return storeToken(token, expiresIn, undefined, 0)
 }
 
 function buildAuthUrl(cfg: OciAuthConfig, redirectUri: string, state: string): string {
@@ -783,6 +903,12 @@ async function fetchTokenDeviceFlow(cfg: OciAuthConfig): Promise<string> {
 
 // ── 5c  Shared token-endpoint POST ───────────────────────────────────────────
 
+class TokenEndpointError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`[oci-auth] Token request failed (${status}): ${body}`)
+  }
+}
+
 async function postForToken(url: string, headers: Record<string, string>, body: URLSearchParams): Promise<string> {
   const grantType = body.get("grant_type") ?? "unknown"
   log.debug("postForToken: POST to token endpoint", { url, grant_type: grantType })
@@ -790,7 +916,7 @@ async function postForToken(url: string, headers: Record<string, string>, body: 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     log.error("Token endpoint error", { status: res.status, grant_type: grantType, body: text })
-    throw new Error(`[oci-auth] Token request failed (${res.status}): ${text}`)
+    throw new TokenEndpointError(res.status, text)
   }
   const json = (await res.json()) as {
     access_token?: string; expires_in?: number
@@ -852,6 +978,8 @@ async function fetchWithTimeout(
   }
 }
 function safeStr(v: unknown): string {
+  // Error properties are non-enumerable, so JSON.stringify(err) would give "{}".
+  if (v instanceof Error) return v.message
   try { return typeof v === "object" ? JSON.stringify(v) : String(v) } catch { return String(v) }
 }
 function escHtml(s: string): string {
@@ -1198,8 +1326,9 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
       `  NODE_TLS_REJECT_UNAUTHORIZED : ${process.env.NODE_TLS_REJECT_UNAUTHORIZED ?? "(not set)"}`
     writeLog("INFO", startupMsg)
     // _ocClient is not set yet (initLogger runs after config loads), so writeLog
-    // above only reaches the disk file. Forward explicitly to the OpenCode console.
-    await client.app.log({ body: { service: "oci-auth", level: "info", message: startupMsg } }).catch(() => {})
+    // above only reaches the disk file. Forward explicitly to the OpenCode console
+    // at WARN so it is visible at OpenCode's default log level, not only with DEBUG.
+    await client.app.log({ body: { service: "oci-auth", level: "warn", message: startupMsg } }).catch(() => {})
   }
 
   const cfg = loadConfig(projectPath)
@@ -1229,8 +1358,11 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
     client_id: maskStr(cfg.client_id)
   })
 
-  await client.app.log({ body: { service: "oci-auth", level: "info",
-    message: `OCI auth plugin ready v${PLUGIN_VERSION} | method: ${cfg.auth_method} | llm_base_url: ${cfg.llm_base_url} | domain: ${cfg.domain_url}` } })
+  // WARN so the loaded version and settings show at OpenCode's default log level.
+  await client.app.log({ body: { service: "oci-auth", level: "warn",
+    message: `OCI auth plugin ready v${PLUGIN_VERSION} | method: ${cfg.auth_method} | llm_base_url: ${cfg.llm_base_url} | ` +
+             `domain: ${cfg.domain_url} | client_id: ${maskStr(cfg.client_id)} | log_level: ${cfg.log_level} | ` +
+             `log_file: ${_logFile} | config: ${_configPath} | token cache: ${CACHE_PATH}` } })
 
   // Warm memory cache from disk. If auth_on_startup is true, also fetch fresh.
   const disk = readDiskCache()
@@ -1354,7 +1486,11 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
               }
             }
 
-            // Browser flow (confidential_app)
+            // Browser flow (confidential_app) — like Claude Code's login: we open the
+            // browser AND accept a pasted redirect URL, so login still works when the
+            // browser can't open or the localhost redirect can't reach this machine.
+            // OpenCode's "code" dialog requires input, so after an automatic redirect
+            // the user just types "ok".
             const internalUri     = cfg.redirect_uri ?? "http://localhost:8888/callback"
             const internalUrl     = new URL(internalUri)
             const listenPort      = Number(internalUrl.port) || 8888
@@ -1362,38 +1498,115 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
             const state           = randomState()
             const authUrl         = buildAuthUrl(cfg, publicRedirectUri, state)
 
-            // Start the callback server NOW (before browser opens) so it is
-            // ready when OCI redirects the user back.
-            const { codePromise, cleanup } = startCallbackServer(
-              internalUrl, listenPort, state, authUrl, cfg.browser_timeout_seconds
-            )
+            // The local callback server is best-effort: if the port is unavailable
+            // the user can still finish by pasting the redirect URL.
+            let local: { codePromise: Promise<string>; cleanup: () => void } | null = null
+            try {
+              local = await startCallbackServer(
+                internalUrl, listenPort, state, authUrl, cfg.browser_timeout_seconds,
+                "Authentication successful - return to OpenCode, type ok and press Enter.",
+              )
+            } catch (err) {
+              log.warn("authorize(): local callback server unavailable — paste flow only", safeStr(err))
+            }
 
-            // tokenPromise: resolves when code is exchanged for a token.
-            // Stored in _authInProgress so chat.params can wait on this flow
-            // instead of independently calling openBrowser() and opening a second window.
-            const tokenPromise = codePromise.then(code => {
-              log.debug("authorize(): auth code received — exchanging for token")
-              return exchangeCodeForToken(cfg, code, publicRedirectUri)
-            })
-            _authInProgress = tokenPromise.finally(() => { _authInProgress = null })
+            // localToken: resolves when the redirect hits our server and the code is
+            // exchanged. Stored in _authInProgress so chat.params waits on this flow
+            // instead of opening a second browser window.
+            let localGotCode = false
+            let localToken: Promise<string> | null = null
+            if (local) {
+              localToken = local.codePromise.then(code => {
+                localGotCode = true
+                log.debug("authorize(): auth code received — exchanging for token")
+                return exchangeCodeForToken(cfg, code, publicRedirectUri)
+              })
+              const inFlight: Promise<string> = localToken.finally(() => {
+                if (_authInProgress === inFlight) _authInProgress = null
+              })
+              inFlight.catch(() => { /* surfaced via callback() / getToken() */ })
+              _authInProgress = inFlight
+            }
 
-            log.info("authorize(): returning OCI auth URL", { authUrl })
+            log.info("authorize(): opening browser, paste fallback enabled", { authUrl })
+            openBrowser(authUrl)
 
             return {
-              method:       "auto" as const,
-              url:          authUrl,        // OpenCode opens this in the browser
-              instructions: "Complete OCI login in your browser, then return here",
-              async callback() {
-                log.debug("authorize.callback() invoked — awaiting token")
+              method:       "code" as const,
+              url:          authUrl,
+              instructions:
+                "A browser window should open for OCI sign-in. When it shows \"Authentication successful\", " +
+                "type ok and press Enter. If no browser opened, open the link below. If the page after " +
+                "sign-in fails to load, copy the full URL from its address bar and paste it here.",
+              async callback(input: string) {
                 try {
-                  const token = await tokenPromise
+                  const trimmed = input.trim()
+                  const isPaste = /^https?:\/\//i.test(trimmed) || trimmed.includes("code=") || trimmed.length >= 16
+                  let token: string | null = null
+
+                  if (localToken && (localGotCode || !isPaste)) {
+                    // The redirect reached us (or the user typed "ok") — use the local
+                    // result; a pasted copy of the same code would fail as already used.
+                    token = await Promise.race([localToken.catch(() => null), sleep(10_000).then(() => null)])
+                    token ??= getCachedToken()
+                    if (!token && !isPaste) throw new Error("Sign-in not completed yet — finish in the browser, or paste the redirect URL")
+                  }
+
+                  if (!token) {
+                    local?.cleanup()
+                    const pasted = parsePastedAuthInput(trimmed, state)
+                    token = "accessToken" in pasted
+                      ? storePastedAccessToken(pasted.accessToken)
+                      : await exchangeCodeForToken(cfg, pasted.code, publicRedirectUri)
+                  }
+
                   log.info("authorize.callback() browser flow completed successfully")
                   return { type: "success" as const, provider: "oci-oidc",
                            key: "apiKey", metadata: { apiKey: token } }
                 } catch (err) {
+                  // "failed" lets OpenCode show "Invalid code" and the user can retry
+                  // (e.g. paste the URL) in the same dialog.
                   log.error("[oci-auth] authorize().callback() browser flow failed", safeStr(err))
-                  cleanup()
-                  throw err instanceof Error ? err : new Error(String(err))
+                  return { type: "failed" as const }
+                }
+              },
+            }
+          },
+        },
+        {
+          // Paste-only fallback: no local callback server, no browser launch.
+          // Kept separate so login remains possible if the combined flow above
+          // misbehaves (port conflicts, browser launch issues, OpenCode UI changes).
+          type:    "oauth" as const,
+          label:   "OCI OIDC — copy URL & paste code (remote / no browser)",
+          prompts: [],
+
+          async authorize() {
+            const internalUri       = cfg.redirect_uri ?? "http://localhost:8888/callback"
+            const publicRedirectUri = cfg.browser_redirect_uri ?? internalUri
+            const state             = randomState()
+            const authUrl           = buildAuthUrl(cfg, publicRedirectUri, state)
+            log.info("authorize(): manual paste flow — returning OCI auth URL", { authUrl })
+
+            return {
+              method:       "code" as const,
+              url:          authUrl,
+              instructions:
+                "Open the link below in any browser and sign in. You'll be redirected to " +
+                `${publicRedirectUri}?code=… (the page may fail to load — that's fine). ` +
+                "Copy the full URL from the address bar (or just the code) and paste it here.",
+              async callback(input: string) {
+                try {
+                  const pasted = parsePastedAuthInput(input, state)
+                  const token = "accessToken" in pasted
+                    ? storePastedAccessToken(pasted.accessToken)
+                    : await exchangeCodeForToken(cfg, pasted.code, publicRedirectUri)
+                  log.info("authorize().callback() manual paste flow completed successfully")
+                  return { type: "success" as const, provider: "oci-oidc",
+                           key: "apiKey", metadata: { apiKey: token } }
+                } catch (err) {
+                  log.error("[oci-auth] manual paste flow failed", safeStr(err))
+                  return { type: "failed" as const }
                 }
               },
             }
@@ -1430,12 +1643,15 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
           errInner?.message ?? errObj?.message ?? ""
         ).toLowerCase()
 
+        // Keep this narrow: a bare "token" match also hits context-length errors
+        // ("maximum context length is N tokens"), and our own "[oci-auth]" errors
+        // must not loop back into another refresh.
         const isAuthError =
-          statusCode === 401 ||
-          errMsg.includes("authentication") ||
-          errMsg.includes("unauthorized") ||
-          errMsg.includes("token") ||
-          errMsg.includes("expired")
+          !errMsg.includes("[oci-auth") && (
+            statusCode === 401 ||
+            errMsg.includes("unauthorized") ||
+            /invalid[_ ]token|token (has )?expired|expired token|authentication (error|failed)/.test(errMsg)
+          )
 
         if (isAuthError) {
           log.warn(
@@ -1444,8 +1660,13 @@ export const OciOidcPlugin: Plugin = async ({ project, client }) => {
           )
           // Expire the access token in memory but keep the refresh_token on disk.
           // tryRefreshToken() reads the disk cache to find the refresh_token.
-          if (_memCache) _memCache = { ..._memCache, access_token: "", expires_at: 0 }
-          else { try { const { unlinkSync: rm } = await import("fs"); rm(CACHE_PATH) } catch { /* ok */ } }
+          // Expire it on disk too, otherwise the refresh would just reload the
+          // rejected token from the disk cache.
+          const current = _memCache ?? readDiskCache()
+          if (current) {
+            _memCache = { ...current, access_token: "", expires_at: 0 }
+            writeDiskCache(_memCache)
+          }
 
           // IMPORTANT: only try SILENT refresh here — never open a browser from an
           // event handler.  If tryRefreshToken() fails (no refresh_token, or OCI

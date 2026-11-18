@@ -6,6 +6,8 @@
 #   ./publish.sh minor      — bump minor version (1.1.0 → 1.2.0) then publish
 #   ./publish.sh major      — bump major version (1.1.0 → 2.0.0) then publish
 #   ./publish.sh --dry-run  — full run but no actual publish
+#   ./publish.sh --tag=next — publish under a dist-tag other than "latest"
+#                             (required for prerelease versions like 1.2.0-beta.0)
 
 set -euo pipefail
 
@@ -15,12 +17,14 @@ cd "$SCRIPT_DIR"
 DRY_RUN=false
 BUMP=""
 OTP=""
+TAG=""
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
     patch|minor|major) BUMP="$arg" ;;
     --otp=*) OTP="${arg#--otp=}" ;;
+    --tag=*) TAG="${arg#--tag=}" ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
@@ -97,13 +101,20 @@ VERSION=$(node -p "require('./package.json').version")
 echo "[ 6/6 ] Publishing opencode-oci-oidc@$VERSION to npm..."
 echo ""
 
+TAG_FLAG=""
+[[ -n "$TAG" ]] && TAG_FLAG="--tag=$TAG"
+if [[ "$VERSION" == *-* && -z "$TAG" ]]; then
+  echo "  ERROR: $VERSION is a prerelease — pass --tag=<name> (e.g. --tag=next) so it doesn't become 'latest'."
+  exit 1
+fi
+
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "        DRY RUN — skipping actual publish."
-  echo "        Would have run: npm publish --access public"
+  echo "        Would have run: npm publish --access public $TAG_FLAG"
 else
   OTP_FLAG=""
   [[ -n "$OTP" ]] && OTP_FLAG="--otp=$OTP"
-  npm publish --access public $OTP_FLAG
+  npm publish --access public $TAG_FLAG $OTP_FLAG
   echo ""
   echo "  Published: https://www.npmjs.com/package/opencode-oci-oidc"
 fi
