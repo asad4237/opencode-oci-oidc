@@ -1267,7 +1267,14 @@ export const OciOidcPlugin = async ({ project, client }) => {
         // ── Token → shell env ────────────────────────────────────────────────────
         "shell.env": async (_input, output) => {
             try {
-                output.env.OCI_BEARER_TOKEN = await getToken(cfg);
+                // Cached token or silent refresh only — opening a terminal or running a
+                // shell command must never pop up a browser login.
+                const token = getCachedToken() ?? await tryRefreshToken(cfg);
+                if (!token) {
+                    log.debug("shell.env: no token available — skipping (login triggers on the next LLM request)");
+                    return;
+                }
+                output.env.OCI_BEARER_TOKEN = token;
                 output.env.OCI_OIDC_ACTIVE = "1";
                 log.verbose("Token injected into shell env");
             }
@@ -1544,14 +1551,9 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 // startup probe (fires within ~100 ms of this event) from real user requests.
                 _sessionCreatedAt = Date.now();
                 log.debug("session.created: timestamp recorded", { _sessionCreatedAt });
-                // A new session means any in-flight browser/device auth from a previous
-                // session is dead (user may have closed the browser or the session aborted).
-                // Reset the mutex so the next request starts a fresh auth flow instead of
-                // waiting forever on a Promise that will never resolve.
-                if (_authInProgress) {
-                    log.warn("session.created: clearing stale _authInProgress from previous session");
-                    _authInProgress = null;
-                }
+                // An in-flight login is deliberately kept across sessions: every browser
+                // and device flow now settles on its own timeout, and clearing it here
+                // made the next request open a second browser window.
                 const cached = getCachedToken();
                 const disk = _memCache ?? readDiskCache();
                 if (cached) {
