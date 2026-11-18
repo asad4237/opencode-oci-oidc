@@ -1,6 +1,6 @@
 {
   "name": "opencode-oci-oidc",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "description": "OpenCode plugin: OCI OIDC Auth — authenticates with OCI IAM (Confidential App or Mobile App / Device flow) and injects Bearer tokens into an OpenAI-compatible LLM endpoint.",
   "main": "dist/index.js",
   "module": "dist/index.js",

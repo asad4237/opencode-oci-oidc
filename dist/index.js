@@ -1508,7 +1508,10 @@ export const OciOidcPlugin = async ({ project, client }) => {
                 // Keep this narrow: a bare "token" match also hits context-length errors
                 // ("maximum context length is N tokens"), and our own "[oci-auth]" errors
                 // must not loop back into another refresh.
-                const isAuthError = !errMsg.includes("[oci-auth") && (statusCode === 401 ||
+                // When the backend gives a status, trust it: e.g. a 403 "unauthorized: no
+                // registry credential for backend" is a routing/permission problem, and
+                // expiring the (valid) token for it forced a needless browser login.
+                const isAuthError = !errMsg.includes("[oci-auth") && (statusCode === undefined || statusCode === 401) && (statusCode === 401 ||
                     errMsg.includes("unauthorized") ||
                     /invalid[_ ]token|token (has )?expired|expired token|authentication (error|failed)/.test(errMsg));
                 if (isAuthError) {
